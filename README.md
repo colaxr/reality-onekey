@@ -55,6 +55,7 @@ x                             # 快捷呼出交互菜单
 - REALITY 目标地址（target）；
 - 分享链接中的服务器公网 IP 或域名。
 - 客户端 uTLS 指纹（`fp`，默认 `chrome`）。
+- 节点显示名称（支持中文和空格，并自动进行 URL 编码）。
 
 UUID、X25519 密钥和 Short ID 会使用 Xray/OpenSSL 安全生成。客户端信息保存在
 `/etc/reality-onekey/node.env`，权限为 `600`；服务端配置保存在
