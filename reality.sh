@@ -81,6 +81,14 @@ validate_domain() {
   [[ "$1" =~ ^([A-Za-z0-9-]+\.)+[A-Za-z]{2,}$ ]]
 }
 
+validate_uuid() {
+  [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+validate_short_id() {
+  [[ "$1" =~ ^([0-9a-fA-F]{2}){1,8}$ ]]
+}
+
 validate_server_address() {
   [[ -n "$1" && "$1" =~ ^[A-Za-z0-9.::_-]+$ ]]
 }
@@ -308,6 +316,49 @@ show_node() {
   green "$link"
 }
 
+edit_node() {
+  load_node || return 1
+  local server_ip port uuid domain dest short_id private_key
+  local backup_config backup_env
+  private_key="$(sed -n 's/.*"privateKey":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_FILE" | head -n1)"
+  if [[ -z "$private_key" ]]; then
+    yellow "无法读取现有 REALITY 私钥，配置未修改。"
+    return 1
+  fi
+
+  server_ip="$(prompt "服务器公网 IP/域名" "$SERVER_IP")"
+  validate_server_address "$server_ip" || { yellow "服务器地址格式不正确。"; return 1; }
+  port="$(prompt "监听端口" "$PORT")"
+  validate_port "$port" || { yellow "端口必须是 1-65535 的整数。"; return 1; }
+  uuid="$(prompt "UUID" "$UUID")"
+  validate_uuid "$uuid" || { yellow "UUID 格式不正确。"; return 1; }
+  domain="$(prompt "伪装域名（SNI）" "$SNI")"
+  validate_domain "$domain" || { yellow "伪装域名格式不正确。"; return 1; }
+  dest="$(prompt "目标地址" "$DEST")"
+  [[ "$dest" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] ||
+    { yellow "目标地址格式应为 域名:端口。"; return 1; }
+  short_id="$(prompt "Short ID" "$SHORT_ID")"
+  validate_short_id "$short_id" ||
+    { yellow "Short ID 必须是 2-16 位偶数长度的十六进制字符。"; return 1; }
+
+  backup_config="$(mktemp)"
+  backup_env="$(mktemp)"
+  cp "$CONFIG_FILE" "$backup_config"
+  cp "$ENV_FILE" "$backup_env"
+  write_config "$port" "$uuid" "$domain" "$dest" "$private_key" "$PUBLIC_KEY" "$short_id" "$server_ip"
+  if ! "$XRAY_BIN" run -test -c "$CONFIG_FILE"; then
+    cp "$backup_config" "$CONFIG_FILE"
+    cp "$backup_env" "$ENV_FILE"
+    rm -f -- "$backup_config" "$backup_env"
+    yellow "新配置校验失败，已恢复原配置。"
+    return 1
+  fi
+  rm -f -- "$backup_config" "$backup_env"
+  service_restart
+  green "节点配置已修改并重启。请确认已放行 TCP ${port}。"
+  show_node
+}
+
 uninstall_reality() {
   local answer="${1:-}"
   if [[ "$answer" != "--yes" ]]; then
@@ -356,16 +407,17 @@ update_script() {
 menu() {
   while true; do
     printf '\nREALITY 一键管理脚本\n'
-    printf '1. 安装/重新配置\n2. 查询节点\n3. 查看服务状态\n4. 更新 Xray\n5. 更新管理脚本\n6. 删除已安装节点\n7. 完全卸载\n0. 退出\n'
-    read -r -p "请选择 [0-7]: " choice
+    printf '1. 安装/重新配置\n2. 修改节点配置\n3. 查询节点\n4. 查看服务状态\n5. 更新 Xray\n6. 更新管理脚本\n7. 删除已安装节点\n8. 完全卸载\n0. 退出\n'
+    read -r -p "请选择 [0-8]: " choice
     case "$choice" in
       1) install_reality ;;
-      2) show_node || true ;;
-      3) service_status ;;
-      4) update_xray ;;
-      5) update_script || true ;;
-      6) delete_node ;;
-      7) uninstall_reality ;;
+      2) edit_node || true ;;
+      3) show_node || true ;;
+      4) service_status ;;
+      5) update_xray ;;
+      6) update_script || true ;;
+      7) delete_node ;;
+      8) uninstall_reality ;;
       0) exit 0 ;;
       *) yellow "无效选项。" ;;
     esac
@@ -380,6 +432,7 @@ main() {
   detect_system
   case "${1:-menu}" in
     install) install_reality ;;
+    edit) edit_node ;;
     show) show_node ;;
     status) service_status ;;
     update) update_xray ;;
@@ -388,7 +441,7 @@ main() {
     uninstall) uninstall_reality "${2:-}" ;;
     menu) menu ;;
     -h|--help)
-      printf '用法: %s [install|show|status|update|self-update|remove-node [--yes]|uninstall [--yes]|menu]\n' "$0"
+      printf '用法: %s [install|edit|show|status|update|self-update|remove-node [--yes]|uninstall [--yes]|menu]\n' "$0"
       ;;
     *) die "未知命令：$1" ;;
   esac
