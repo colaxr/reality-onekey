@@ -315,6 +315,9 @@ menu() {
 
 main() {
   require_root
+  if [[ ! -t 0 ]]; then
+    exec </dev/tty || die "无法连接交互终端，请直接运行：sudo /usr/local/bin/reality"
+  fi
   detect_system
   case "${1:-menu}" in
     install) install_reality ;;
