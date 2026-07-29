@@ -287,13 +287,16 @@ install_reality() {
 }
 
 load_node() {
-  [[ -r "$ENV_FILE" ]] || die "尚未安装或节点配置不存在。"
+  if [[ ! -r "$ENV_FILE" ]]; then
+    yellow "尚未安装或节点配置不存在。"
+    return 1
+  fi
   # shellcheck disable=SC1090
   . "$ENV_FILE"
 }
 
 show_node() {
-  load_node
+  load_node || return 1
   local host link
   host="$SERVER_IP"
   [[ "$host" == *:* && "$host" != \[*\] ]] && host="[${host}]"
@@ -332,7 +335,7 @@ menu() {
     read -r -p "请选择 [0-6]: " choice
     case "$choice" in
       1) install_reality ;;
-      2) show_node ;;
+      2) show_node || true ;;
       3) service_status ;;
       4) update_xray ;;
       5) delete_node ;;
