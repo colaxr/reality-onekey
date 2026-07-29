@@ -39,6 +39,7 @@ sudo reality install          # 安装或重新生成节点配置
 sudo reality show             # 查询节点参数和 VLESS 分享链接
 sudo reality status           # 查看服务状态
 sudo reality update           # 更新至最新版 Xray
+sudo reality remove-node      # 删除节点，保留 Xray 和管理命令
 sudo reality uninstall        # 交互式完全卸载
 sudo reality uninstall --yes  # 无确认完全卸载
 sudo reality                  # 打开交互菜单
@@ -63,11 +64,12 @@ UUID、X25519 密钥和 Short ID 会使用 Xray/OpenSSL 安全生成。客户端
 4. 请遵守服务器所在地法律法规及服务商条款。
 5. 重新安装会生成新的 UUID 和密钥，旧节点链接随即失效。
 
-## 完全卸载范围
+## 删除节点与完全卸载
 
-卸载会停止并删除服务，删除 Xray 二进制、Geo 数据、REALITY 服务端配置、节点参数、
-PID 和相关日志。脚本不会修改云安全组，也不会删除系统中原有的 curl、unzip、
-OpenSSL 等公共依赖。
+“删除节点”会停止并删除服务、REALITY 服务端配置、节点参数、PID 和相关日志，但
+保留 Xray 二进制、Geo 数据和 `reality` 管理命令。“完全卸载”还会删除 Xray 与
+Geo 数据。脚本不会修改云安全组，也不会删除系统中原有的 curl、unzip、OpenSSL
+等公共依赖。
 
 ## 安全说明
 
