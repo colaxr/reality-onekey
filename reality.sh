@@ -176,6 +176,26 @@ service_status() {
   fi
 }
 
+remove_node_files() {
+  service_stop
+  rm -f -- "$SYSTEMD_FILE" "$OPENRC_FILE"
+  rm -rf -- "$APP_DIR"
+  rm -f -- "/var/log/${APP_NAME}.log" "/var/log/${APP_NAME}.err" "/run/${APP_NAME}.pid"
+  [[ "$INIT" == "systemd" ]] && systemctl daemon-reload
+}
+
+delete_node() {
+  local answer="${1:-}"
+  [[ -e "$CONFIG_FILE" || -e "$SYSTEMD_FILE" || -e "$OPENRC_FILE" ]] ||
+    { yellow "未发现已安装的节点。"; return; }
+  if [[ "$answer" != "--yes" ]]; then
+    read -r -p "将删除当前节点配置和服务，但保留 Xray 与管理命令，确定吗？[y/N]: " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || { yellow "已取消。"; return; }
+  fi
+  remove_node_files
+  green "已删除当前节点；Xray 和 reality 管理命令仍保留。"
+}
+
 write_config() {
   local port="$1" uuid="$2" domain="$3" dest="$4" private_key="$5" public_key="$6"
   local short_id="$7" server_ip="$8"
@@ -284,11 +304,9 @@ uninstall_reality() {
     read -r -p "将完全删除 Xray、REALITY 配置、服务和日志，确定吗？[y/N]: " answer
     [[ "$answer" =~ ^[Yy]$ ]] || { yellow "已取消。"; return; }
   fi
-  service_stop
-  rm -f -- "$SYSTEMD_FILE" "$OPENRC_FILE" "$XRAY_BIN"
-  rm -rf -- "$APP_DIR" "$XRAY_DIR"
-  rm -f -- "/var/log/${APP_NAME}.log" "/var/log/${APP_NAME}.err" "/run/${APP_NAME}.pid"
-  [[ "$INIT" == "systemd" ]] && systemctl daemon-reload
+  remove_node_files
+  rm -f -- "$XRAY_BIN"
+  rm -rf -- "$XRAY_DIR"
   green "已完全卸载 REALITY One-key。"
 }
 
@@ -303,14 +321,15 @@ update_xray() {
 menu() {
   while true; do
     printf '\nREALITY 一键管理脚本\n'
-    printf '1. 安装/重新配置\n2. 查询节点\n3. 查看服务状态\n4. 更新 Xray\n5. 完全卸载\n0. 退出\n'
-    read -r -p "请选择 [0-5]: " choice
+    printf '1. 安装/重新配置\n2. 查询节点\n3. 查看服务状态\n4. 更新 Xray\n5. 删除已安装节点\n6. 完全卸载\n0. 退出\n'
+    read -r -p "请选择 [0-6]: " choice
     case "$choice" in
       1) install_reality ;;
       2) show_node ;;
       3) service_status ;;
       4) update_xray ;;
-      5) uninstall_reality ;;
+      5) delete_node ;;
+      6) uninstall_reality ;;
       0) exit 0 ;;
       *) yellow "无效选项。" ;;
     esac
@@ -328,10 +347,11 @@ main() {
     show) show_node ;;
     status) service_status ;;
     update) update_xray ;;
+    remove-node) delete_node "${2:-}" ;;
     uninstall) uninstall_reality "${2:-}" ;;
     menu) menu ;;
     -h|--help)
-      printf '用法: %s [install|show|status|update|uninstall [--yes]|menu]\n' "$0"
+      printf '用法: %s [install|show|status|update|remove-node [--yes]|uninstall [--yes]|menu]\n' "$0"
       ;;
     *) die "未知命令：$1" ;;
   esac
