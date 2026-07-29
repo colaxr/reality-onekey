@@ -93,6 +93,25 @@ validate_fingerprint() {
   [[ "$1" =~ ^[A-Za-z0-9_-]{1,32}$ ]]
 }
 
+validate_node_name() {
+  [[ -n "$1" && ${#1} -le 64 && "$1" != *"'"* && "$1" != *$'\n'* && "$1" != *$'\r'* ]]
+}
+
+urlencode() {
+  local LC_ALL=C value="$1" output="" char hex index
+  for ((index = 0; index < ${#value}; index++)); do
+    char="${value:index:1}"
+    case "$char" in
+      [a-zA-Z0-9.~_-]) output+="$char" ;;
+      *)
+        printf -v hex '%02X' "'$char"
+        output+="%${hex}"
+        ;;
+    esac
+  done
+  printf '%s' "$output"
+}
+
 validate_server_address() {
   [[ -n "$1" && "$1" =~ ^[A-Za-z0-9.::_-]+$ ]]
 }
@@ -216,6 +235,7 @@ delete_node() {
 write_config() {
   local port="$1" uuid="$2" domain="$3" dest="$4" private_key="$5" public_key="$6"
   local short_id="$7" server_ip="$8" fingerprint="${9:-chrome}"
+  local node_name="${10:-REALITY-${server_ip}}"
   install -d -m700 "$APP_DIR"
   cat >"$CONFIG_FILE" <<EOF
 {
@@ -263,6 +283,7 @@ PUBLIC_KEY='${public_key}'
 SHORT_ID='${short_id}'
 FLOW='xtls-rprx-vision'
 FINGERPRINT='${fingerprint}'
+NODE_NAME='${node_name}'
 EOF
   chmod 600 "$ENV_FILE"
   chown root:"$SERVICE_GROUP" "$APP_DIR" "$CONFIG_FILE"
@@ -271,7 +292,7 @@ EOF
 }
 
 install_reality() {
-  local port domain dest uuid keys private_key public_key short_id server_ip fingerprint
+  local port domain dest uuid keys private_key public_key short_id server_ip fingerprint node_name
   install_dependencies
   if [[ "$(readlink -f "$0" 2>/dev/null || true)" != "$MANAGER_BIN" ]]; then
     install -Dm755 "$0" "$MANAGER_BIN"
@@ -289,6 +310,8 @@ install_reality() {
   validate_server_address "$server_ip" || die "服务器地址格式不正确。"
   fingerprint="$(prompt "客户端指纹（fp）" "chrome")"
   validate_fingerprint "$fingerprint" || die "客户端指纹格式不正确。"
+  node_name="$(prompt "节点名称" "REALITY-${server_ip}")"
+  validate_node_name "$node_name" || die "节点名称不能为空、不能包含单引号/换行，且最长 64 个字符。"
 
   uuid="$("$XRAY_BIN" uuid)"
   keys="$("$XRAY_BIN" x25519)"
@@ -296,7 +319,7 @@ install_reality() {
   public_key="$(printf '%s\n' "$keys" | awk -F': ' 'tolower($1) ~ /(public|password)/ {print $2; exit}')"
   [[ -n "$private_key" && -n "$public_key" ]] || die "生成 REALITY 密钥失败。"
   short_id="$(openssl rand -hex 8)"
-  write_config "$port" "$uuid" "$domain" "$dest" "$private_key" "$public_key" "$short_id" "$server_ip" "$fingerprint"
+  write_config "$port" "$uuid" "$domain" "$dest" "$private_key" "$public_key" "$short_id" "$server_ip" "$fingerprint" "$node_name"
   "$XRAY_BIN" run -test -c "$CONFIG_FILE"
   make_service
   green "安装完成。请确认云防火墙/安全组已放行 TCP ${port}。"
@@ -310,6 +333,7 @@ load_node() {
   fi
   # shellcheck disable=SC1090
   . "$ENV_FILE"
+  : "${NODE_NAME:=REALITY-${SERVER_IP}}"
 }
 
 show_node() {
@@ -317,16 +341,16 @@ show_node() {
   local host link
   host="$SERVER_IP"
   [[ "$host" == *:* && "$host" != \[*\] ]] && host="[${host}]"
-  link="vless://${UUID}@${host}:${PORT}?encryption=none&flow=${FLOW}&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#REALITY-${SERVER_IP}"
+  link="vless://${UUID}@${host}:${PORT}?encryption=none&flow=${FLOW}&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#$(urlencode "$NODE_NAME")"
   printf '\n节点信息\n'
-  printf '服务器：%s\n端口：%s\nUUID：%s\nSNI：%s\nPublic Key：%s\nShort ID：%s\n\n' \
-    "$SERVER_IP" "$PORT" "$UUID" "$SNI" "$PUBLIC_KEY" "$SHORT_ID"
+  printf '名称：%s\n服务器：%s\n端口：%s\nUUID：%s\nSNI：%s\nPublic Key：%s\nShort ID：%s\n\n' \
+    "$NODE_NAME" "$SERVER_IP" "$PORT" "$UUID" "$SNI" "$PUBLIC_KEY" "$SHORT_ID"
   green "$link"
 }
 
 edit_node() {
   load_node || return 1
-  local server_ip port uuid domain dest short_id fingerprint private_key
+  local server_ip port uuid domain dest short_id fingerprint node_name private_key
   local backup_config backup_env
   private_key="$(sed -n 's/.*"privateKey":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_FILE" | head -n1)"
   if [[ -z "$private_key" ]]; then
@@ -351,12 +375,15 @@ edit_node() {
   fingerprint="$(prompt "客户端指纹（fp）" "$FINGERPRINT")"
   validate_fingerprint "$fingerprint" ||
     { yellow "客户端指纹格式不正确。"; return 1; }
+  node_name="$(prompt "节点名称" "$NODE_NAME")"
+  validate_node_name "$node_name" ||
+    { yellow "节点名称不能为空、不能包含单引号/换行，且最长 64 个字符。"; return 1; }
 
   backup_config="$(mktemp)"
   backup_env="$(mktemp)"
   cp "$CONFIG_FILE" "$backup_config"
   cp "$ENV_FILE" "$backup_env"
-  write_config "$port" "$uuid" "$domain" "$dest" "$private_key" "$PUBLIC_KEY" "$short_id" "$server_ip" "$fingerprint"
+  write_config "$port" "$uuid" "$domain" "$dest" "$private_key" "$PUBLIC_KEY" "$short_id" "$server_ip" "$fingerprint" "$node_name"
   if ! "$XRAY_BIN" run -test -c "$CONFIG_FILE"; then
     cp "$backup_config" "$CONFIG_FILE"
     cp "$backup_env" "$ENV_FILE"
