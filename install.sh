@@ -21,4 +21,5 @@ else
 fi
 
 chmod 755 "$TARGET"
+ln -sf "$TARGET" /usr/local/bin/x
 exec "$TARGET" menu </dev/tty
