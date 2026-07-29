@@ -39,6 +39,7 @@ sudo reality install          # 安装或重新生成节点配置
 sudo reality show             # 查询节点参数和 VLESS 分享链接
 sudo reality status           # 查看服务状态
 sudo reality update           # 更新至最新版 Xray
+sudo reality self-update      # 更新管理脚本并重新打开菜单
 sudo reality remove-node      # 删除节点，保留 Xray 和管理命令
 sudo reality uninstall        # 交互式完全卸载
 sudo reality uninstall --yes  # 无确认完全卸载
