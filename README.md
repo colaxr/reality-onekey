@@ -36,6 +36,7 @@ sudo reality
 
 ```text
 sudo reality install          # 安装或重新生成节点配置
+sudo reality edit             # 修改现有节点配置并保留 REALITY 密钥
 sudo reality show             # 查询节点参数和 VLESS 分享链接
 sudo reality status           # 查看服务状态
 sudo reality update           # 更新至最新版 Xray
