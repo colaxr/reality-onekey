@@ -12,6 +12,7 @@ readonly ENV_FILE="${APP_DIR}/node.env"
 readonly SYSTEMD_FILE="/etc/systemd/system/${APP_NAME}.service"
 readonly OPENRC_FILE="/etc/init.d/${APP_NAME}"
 readonly RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+readonly SCRIPT_URL="https://raw.githubusercontent.com/colaxr/reality-onekey/main/reality.sh"
 
 OS=""
 ARCH=""
@@ -328,18 +329,43 @@ update_xray() {
   green "Xray 已更新并重启。"
 }
 
+update_script() {
+  local tmp
+  if ! command -v curl >/dev/null 2>&1; then
+    yellow "缺少 curl，无法更新管理脚本。"
+    return 1
+  fi
+  tmp="$(mktemp)"
+  if ! curl -fL --retry 3 -o "$tmp" "${SCRIPT_URL}?t=$(date +%s)"; then
+    rm -f -- "$tmp"
+    yellow "下载最新版管理脚本失败，当前版本未被修改。"
+    return 1
+  fi
+  if ! bash -n "$tmp"; then
+    rm -f -- "$tmp"
+    yellow "最新版脚本语法检查失败，当前版本未被修改。"
+    return 1
+  fi
+  install -m755 "$tmp" "$MANAGER_BIN"
+  rm -f -- "$tmp"
+  ln -sf "$MANAGER_BIN" "$SHORTCUT_BIN"
+  green "管理脚本已更新到最新版，正在重新打开菜单。"
+  exec "$MANAGER_BIN" menu </dev/tty
+}
+
 menu() {
   while true; do
     printf '\nREALITY 一键管理脚本\n'
-    printf '1. 安装/重新配置\n2. 查询节点\n3. 查看服务状态\n4. 更新 Xray\n5. 删除已安装节点\n6. 完全卸载\n0. 退出\n'
-    read -r -p "请选择 [0-6]: " choice
+    printf '1. 安装/重新配置\n2. 查询节点\n3. 查看服务状态\n4. 更新 Xray\n5. 更新管理脚本\n6. 删除已安装节点\n7. 完全卸载\n0. 退出\n'
+    read -r -p "请选择 [0-7]: " choice
     case "$choice" in
       1) install_reality ;;
       2) show_node || true ;;
       3) service_status ;;
       4) update_xray ;;
-      5) delete_node ;;
-      6) uninstall_reality ;;
+      5) update_script || true ;;
+      6) delete_node ;;
+      7) uninstall_reality ;;
       0) exit 0 ;;
       *) yellow "无效选项。" ;;
     esac
@@ -357,11 +383,12 @@ main() {
     show) show_node ;;
     status) service_status ;;
     update) update_xray ;;
+    self-update) update_script ;;
     remove-node) delete_node "${2:-}" ;;
     uninstall) uninstall_reality "${2:-}" ;;
     menu) menu ;;
     -h|--help)
-      printf '用法: %s [install|show|status|update|remove-node [--yes]|uninstall [--yes]|menu]\n' "$0"
+      printf '用法: %s [install|show|status|update|self-update|remove-node [--yes]|uninstall [--yes]|menu]\n' "$0"
       ;;
     *) die "未知命令：$1" ;;
   esac
