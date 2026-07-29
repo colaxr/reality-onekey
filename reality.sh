@@ -5,6 +5,8 @@ readonly APP_NAME="reality-onekey"
 readonly APP_DIR="/etc/${APP_NAME}"
 readonly XRAY_DIR="/usr/local/share/xray"
 readonly XRAY_BIN="/usr/local/bin/xray"
+readonly MANAGER_BIN="/usr/local/bin/reality"
+readonly SHORTCUT_BIN="/usr/local/bin/x"
 readonly CONFIG_FILE="${APP_DIR}/config.json"
 readonly ENV_FILE="${APP_DIR}/node.env"
 readonly SYSTEMD_FILE="/etc/systemd/system/${APP_NAME}.service"
@@ -256,6 +258,10 @@ EOF
 install_reality() {
   local port domain dest uuid keys private_key public_key short_id server_ip
   install_dependencies
+  if [[ "$(readlink -f "$0" 2>/dev/null || true)" != "$MANAGER_BIN" ]]; then
+    install -Dm755 "$0" "$MANAGER_BIN"
+  fi
+  ln -sf "$MANAGER_BIN" "$SHORTCUT_BIN"
   download_xray
 
   port="$(prompt "监听端口" "443")"
@@ -305,9 +311,10 @@ uninstall_reality() {
     [[ "$answer" =~ ^[Yy]$ ]] || { yellow "已取消。"; return; }
   fi
   remove_node_files
-  rm -f -- "$XRAY_BIN"
+  rm -f -- "$XRAY_BIN" "$SHORTCUT_BIN" "$MANAGER_BIN"
   rm -rf -- "$XRAY_DIR"
   green "已完全卸载 REALITY One-key。"
+  exit 0
 }
 
 update_xray() {
