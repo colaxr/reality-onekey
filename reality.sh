@@ -122,22 +122,29 @@ public_ip() {
 }
 
 download_xray() {
-  local tmp version url
-  tmp="$(mktemp -d)"
-  trap 'rm -rf -- "${tmp:-}"' RETURN
-  version="$(curl -fsSL "$RELEASE_API" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  [[ -n "$version" ]] || die "无法获取 Xray 最新版本。"
+  local tmp version="${1:-}" url
+  tmp="$(mktemp -d)" || return 1
+  if [[ -z "$version" ]]; then
+    version="$(curl -fsSL "$RELEASE_API" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)" ||
+      { rm -rf -- "$tmp"; return 1; }
+  fi
+  [[ "$version" =~ ^v[0-9]+([.][0-9]+){1,3}([._-][A-Za-z0-9.-]+)?$ ]] ||
+    { rm -rf -- "$tmp"; yellow "无效的 Xray 版本号：${version}"; return 1; }
   url="https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-${ARCH}.zip"
   info "下载 Xray ${version} (${ARCH})..."
-  curl -fL --retry 3 -o "${tmp}/xray.zip" "$url"
-  unzip -oq "${tmp}/xray.zip" -d "$tmp"
-  install -Dm755 "${tmp}/xray" "$XRAY_BIN"
-  setcap cap_net_bind_service=+ep "$XRAY_BIN"
-  install -d "$XRAY_DIR"
+  curl -fL --retry 3 -o "${tmp}/xray.zip" "$url" ||
+    { rm -rf -- "$tmp"; return 1; }
+  unzip -oq "${tmp}/xray.zip" -d "$tmp" ||
+    { rm -rf -- "$tmp"; return 1; }
+  install -Dm755 "${tmp}/xray" "$XRAY_BIN" ||
+    { rm -rf -- "$tmp"; return 1; }
+  setcap cap_net_bind_service=+ep "$XRAY_BIN" ||
+    { rm -rf -- "$tmp"; return 1; }
+  install -d "$XRAY_DIR" ||
+    { rm -rf -- "$tmp"; return 1; }
   [[ -f "${tmp}/geoip.dat" ]] && install -m644 "${tmp}/geoip.dat" "${XRAY_DIR}/geoip.dat"
   [[ -f "${tmp}/geosite.dat" ]] && install -m644 "${tmp}/geosite.dat" "${XRAY_DIR}/geosite.dat"
   rm -rf -- "$tmp"
-  trap - RETURN
   "$XRAY_BIN" version | head -n1
 }
 
@@ -298,7 +305,7 @@ install_reality() {
     install -Dm755 "$0" "$MANAGER_BIN"
   fi
   ln -sf "$MANAGER_BIN" "$SHORTCUT_BIN"
-  download_xray
+  download_xray || die "Xray 下载或安装失败。"
 
   port="$(prompt "监听端口" "443")"
   validate_port "$port" || die "端口必须是 1-65535 的整数。"
@@ -411,11 +418,71 @@ uninstall_reality() {
 }
 
 update_xray() {
-  [[ -r "$CONFIG_FILE" ]] || die "请先安装。"
-  download_xray
-  "$XRAY_BIN" run -test -c "$CONFIG_FILE"
-  service_restart
-  green "Xray 已更新并重启。"
+  local current releases choice target index backup
+  local -a versions=()
+  [[ -x "$XRAY_BIN" && -r "$CONFIG_FILE" ]] ||
+    { yellow "请先安装节点。"; return 1; }
+  current="v$("$XRAY_BIN" version | awk 'NR == 1 {print $2}')"
+  releases="$(curl -fsSL --max-time 15 \
+    "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=10" 2>/dev/null || true)"
+  while IFS= read -r target; do
+    [[ -n "$target" ]] || continue
+    versions+=("$target")
+    (( ${#versions[@]} >= 3 )) && break
+  done < <(printf '%s\n' "$releases" |
+    sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p')
+
+  printf '\n当前 Xray 版本：%s\n' "$current"
+  if (( ${#versions[@]} > 0 )); then
+    for index in "${!versions[@]}"; do
+      if [[ "${versions[$index]}" == "$current" ]]; then
+        printf '%d. %s（当前版本）\n' "$((index + 1))" "${versions[$index]}"
+      else
+        printf '%d. %s\n' "$((index + 1))" "${versions[$index]}"
+      fi
+    done
+  else
+    yellow "无法获取官方版本列表，仍可手动输入版本号。"
+  fi
+  printf '%d. 手动输入版本号\n0. 返回菜单\n' "$(( ${#versions[@]} + 1 ))"
+  read -r -p "请选择更新版本: " choice
+  if [[ "$choice" == "0" ]]; then
+    return 0
+  elif [[ "$choice" =~ ^[0-9]+$ ]] &&
+       (( choice >= 1 && choice <= ${#versions[@]} )); then
+    target="${versions[$((choice - 1))]}"
+  elif [[ "$choice" == "$(( ${#versions[@]} + 1 ))" ]]; then
+    target="$(prompt "请输入版本号，例如 v26.5.9")"
+    [[ "$target" == v* ]] || target="v${target}"
+  else
+    yellow "无效选项。"
+    return 1
+  fi
+  [[ "$target" =~ ^v[0-9]+([.][0-9]+){1,3}([._-][A-Za-z0-9.-]+)?$ ]] ||
+    { yellow "版本号格式不正确。"; return 1; }
+  if [[ "$target" == "$current" ]]; then
+    read -r -p "目标版本与当前版本相同，仍要重新安装吗？[y/N]: " choice
+    [[ "$choice" =~ ^[Yy]$ ]] || return 0
+  fi
+
+  backup="$(mktemp -d)"
+  cp "$XRAY_BIN" "$backup/xray"
+  [[ -f "$XRAY_DIR/geoip.dat" ]] && cp "$XRAY_DIR/geoip.dat" "$backup/geoip.dat"
+  [[ -f "$XRAY_DIR/geosite.dat" ]] && cp "$XRAY_DIR/geosite.dat" "$backup/geosite.dat"
+  if ! download_xray "$target" ||
+     ! "$XRAY_BIN" run -test -c "$CONFIG_FILE" ||
+     ! service_restart; then
+    install -m755 "$backup/xray" "$XRAY_BIN"
+    setcap cap_net_bind_service=+ep "$XRAY_BIN"
+    [[ -f "$backup/geoip.dat" ]] && install -m644 "$backup/geoip.dat" "$XRAY_DIR/geoip.dat"
+    [[ -f "$backup/geosite.dat" ]] && install -m644 "$backup/geosite.dat" "$XRAY_DIR/geosite.dat"
+    service_restart || true
+    rm -rf -- "$backup"
+    yellow "更新失败，已恢复 ${current}。"
+    return 1
+  fi
+  rm -rf -- "$backup"
+  green "Xray 已更新到 ${target}，节点配置保持不变。"
 }
 
 update_script() {
@@ -456,7 +523,7 @@ menu() {
       2) edit_node || true ;;
       3) show_node || true ;;
       4) service_status ;;
-      5) update_xray ;;
+      5) update_xray || true ;;
       6) update_script || true ;;
       7) delete_node ;;
       8) uninstall_reality ;;
