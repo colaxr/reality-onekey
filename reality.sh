@@ -138,6 +138,8 @@ ExecStart=${XRAY_BIN} run -c ${CONFIG_FILE}
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 
 [Install]
@@ -363,7 +365,7 @@ edit_node() {
     return 1
   fi
   rm -f -- "$backup_config" "$backup_env"
-  service_restart
+  make_service
   green "节点配置已修改并重启。请确认已放行 TCP ${port}。"
   show_node
 }
