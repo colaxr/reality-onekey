@@ -43,6 +43,7 @@ sudo reality remove-node      # 删除节点，保留 Xray 和管理命令
 sudo reality uninstall        # 交互式完全卸载
 sudo reality uninstall --yes  # 无确认完全卸载
 sudo reality                  # 打开交互菜单
+x                             # 快捷呼出交互菜单
 ```
 
 安装时可自定义：
@@ -67,9 +68,9 @@ UUID、X25519 密钥和 Short ID 会使用 Xray/OpenSSL 安全生成。客户端
 ## 删除节点与完全卸载
 
 “删除节点”会停止并删除服务、REALITY 服务端配置、节点参数、PID 和相关日志，但
-保留 Xray 二进制、Geo 数据和 `reality` 管理命令。“完全卸载”还会删除 Xray 与
-Geo 数据。脚本不会修改云安全组，也不会删除系统中原有的 curl、unzip、OpenSSL
-等公共依赖。
+保留 Xray 二进制、Geo 数据及 `reality`、`x` 管理命令。“完全卸载”还会删除
+Xray、Geo 数据、管理脚本与 `x` 快捷命令，并立即退出菜单。脚本不会修改云安全
+组，也不会删除系统中原有的 curl、unzip、OpenSSL 等公共依赖。
 
 ## 安全说明
 
