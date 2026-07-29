@@ -89,6 +89,10 @@ validate_short_id() {
   [[ "$1" =~ ^([0-9a-fA-F]{2}){1,8}$ ]]
 }
 
+validate_fingerprint() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]{1,32}$ ]]
+}
+
 validate_server_address() {
   [[ -n "$1" && "$1" =~ ^[A-Za-z0-9.::_-]+$ ]]
 }
@@ -209,7 +213,7 @@ delete_node() {
 
 write_config() {
   local port="$1" uuid="$2" domain="$3" dest="$4" private_key="$5" public_key="$6"
-  local short_id="$7" server_ip="$8"
+  local short_id="$7" server_ip="$8" fingerprint="${9:-chrome}"
   install -d -m700 "$APP_DIR"
   cat >"$CONFIG_FILE" <<EOF
 {
@@ -256,7 +260,7 @@ DEST='${dest}'
 PUBLIC_KEY='${public_key}'
 SHORT_ID='${short_id}'
 FLOW='xtls-rprx-vision'
-FINGERPRINT='chrome'
+FINGERPRINT='${fingerprint}'
 EOF
   chmod 600 "$ENV_FILE"
   chown root:"$SERVICE_GROUP" "$APP_DIR" "$CONFIG_FILE"
@@ -265,7 +269,7 @@ EOF
 }
 
 install_reality() {
-  local port domain dest uuid keys private_key public_key short_id server_ip
+  local port domain dest uuid keys private_key public_key short_id server_ip fingerprint
   install_dependencies
   if [[ "$(readlink -f "$0" 2>/dev/null || true)" != "$MANAGER_BIN" ]]; then
     install -Dm755 "$0" "$MANAGER_BIN"
@@ -281,6 +285,8 @@ install_reality() {
   [[ "$dest" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] || die "目标地址格式应为 域名:端口。"
   server_ip="$(prompt "服务器公网 IP/域名" "$(public_ip)")"
   validate_server_address "$server_ip" || die "服务器地址格式不正确。"
+  fingerprint="$(prompt "客户端指纹（fp）" "chrome")"
+  validate_fingerprint "$fingerprint" || die "客户端指纹格式不正确。"
 
   uuid="$("$XRAY_BIN" uuid)"
   keys="$("$XRAY_BIN" x25519)"
@@ -288,7 +294,7 @@ install_reality() {
   public_key="$(printf '%s\n' "$keys" | awk -F': ' 'tolower($1) ~ /(public|password)/ {print $2; exit}')"
   [[ -n "$private_key" && -n "$public_key" ]] || die "生成 REALITY 密钥失败。"
   short_id="$(openssl rand -hex 8)"
-  write_config "$port" "$uuid" "$domain" "$dest" "$private_key" "$public_key" "$short_id" "$server_ip"
+  write_config "$port" "$uuid" "$domain" "$dest" "$private_key" "$public_key" "$short_id" "$server_ip" "$fingerprint"
   "$XRAY_BIN" run -test -c "$CONFIG_FILE"
   make_service
   green "安装完成。请确认云防火墙/安全组已放行 TCP ${port}。"
@@ -318,7 +324,7 @@ show_node() {
 
 edit_node() {
   load_node || return 1
-  local server_ip port uuid domain dest short_id private_key
+  local server_ip port uuid domain dest short_id fingerprint private_key
   local backup_config backup_env
   private_key="$(sed -n 's/.*"privateKey":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_FILE" | head -n1)"
   if [[ -z "$private_key" ]]; then
@@ -340,12 +346,15 @@ edit_node() {
   short_id="$(prompt "Short ID" "$SHORT_ID")"
   validate_short_id "$short_id" ||
     { yellow "Short ID 必须是 2-16 位偶数长度的十六进制字符。"; return 1; }
+  fingerprint="$(prompt "客户端指纹（fp）" "$FINGERPRINT")"
+  validate_fingerprint "$fingerprint" ||
+    { yellow "客户端指纹格式不正确。"; return 1; }
 
   backup_config="$(mktemp)"
   backup_env="$(mktemp)"
   cp "$CONFIG_FILE" "$backup_config"
   cp "$ENV_FILE" "$backup_env"
-  write_config "$port" "$uuid" "$domain" "$dest" "$private_key" "$PUBLIC_KEY" "$short_id" "$server_ip"
+  write_config "$port" "$uuid" "$domain" "$dest" "$private_key" "$PUBLIC_KEY" "$short_id" "$server_ip" "$fingerprint"
   if ! "$XRAY_BIN" run -test -c "$CONFIG_FILE"; then
     cp "$backup_config" "$CONFIG_FILE"
     cp "$backup_env" "$ENV_FILE"
