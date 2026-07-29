@@ -21,7 +21,4 @@ else
 fi
 
 chmod 755 "$TARGET"
-if [[ -r /dev/tty ]]; then
-  exec "$TARGET" menu </dev/tty
-fi
-exec "$TARGET" menu
+exec "$TARGET" menu </dev/tty
