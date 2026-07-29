@@ -15,6 +15,7 @@ OS=""
 ARCH=""
 INIT=""
 PKG=""
+SERVICE_GROUP=""
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -31,8 +32,8 @@ detect_system() {
   # shellcheck disable=SC1091
   . /etc/os-release
   case "${ID:-}" in
-    debian|ubuntu) OS="$ID"; PKG="apt" ;;
-    alpine) OS="alpine"; PKG="apk" ;;
+    debian|ubuntu) OS="$ID"; PKG="apt"; SERVICE_GROUP="nogroup" ;;
+    alpine) OS="alpine"; PKG="apk"; SERVICE_GROUP="nobody" ;;
     *) die "仅支持 Debian、Ubuntu 和 Alpine（当前：${ID:-unknown}）。" ;;
   esac
   case "$(uname -m)" in
@@ -227,6 +228,9 @@ FLOW='xtls-rprx-vision'
 FINGERPRINT='chrome'
 EOF
   chmod 600 "$ENV_FILE"
+  chown root:"$SERVICE_GROUP" "$APP_DIR" "$CONFIG_FILE"
+  chmod 750 "$APP_DIR"
+  chmod 640 "$CONFIG_FILE"
 }
 
 install_reality() {
