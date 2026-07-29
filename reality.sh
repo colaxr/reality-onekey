@@ -12,7 +12,7 @@ readonly ENV_FILE="${APP_DIR}/node.env"
 readonly SYSTEMD_FILE="/etc/systemd/system/${APP_NAME}.service"
 readonly OPENRC_FILE="/etc/init.d/${APP_NAME}"
 readonly RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
-readonly SCRIPT_URL="https://raw.githubusercontent.com/colaxr/reality-onekey/main/reality.sh"
+readonly SCRIPT_API_URL="https://api.github.com/repos/colaxr/reality-onekey/contents/reality.sh?ref=main"
 
 OS=""
 ARCH=""
@@ -387,7 +387,11 @@ update_script() {
     return 1
   fi
   tmp="$(mktemp)"
-  if ! curl -fL --retry 3 -o "$tmp" "${SCRIPT_URL}?t=$(date +%s)"; then
+  if ! curl -fL --retry 3 \
+    -H "Accept: application/vnd.github.raw+json" \
+    -H "Cache-Control: no-cache" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    -o "$tmp" "$SCRIPT_API_URL"; then
     rm -f -- "$tmp"
     yellow "下载最新版管理脚本失败，当前版本未被修改。"
     return 1
