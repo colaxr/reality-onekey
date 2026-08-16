@@ -13,6 +13,7 @@ readonly SYSTEMD_FILE="/etc/systemd/system/${APP_NAME}.service"
 readonly OPENRC_FILE="/etc/init.d/${APP_NAME}"
 readonly RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 readonly SCRIPT_API_URL="https://api.github.com/repos/colaxr/reality-onekey/contents/reality.sh?ref=main"
+readonly MIN_CLIENT_VERSION="1.0.0"
 
 OS=""
 ARCH=""
@@ -264,6 +265,7 @@ write_config() {
         "xver": 0,
         "serverNames": ["${domain}"],
         "privateKey": "${private_key}",
+        "minClientVer": "${MIN_CLIENT_VERSION}",
         "shortIds": ["${short_id}"]
       }
     },
@@ -417,6 +419,27 @@ uninstall_reality() {
   exit 0
 }
 
+ensure_min_client_version() {
+  local backup
+  [[ -r "$CONFIG_FILE" ]] || return 1
+  backup="$(mktemp)" || return 1
+  cp "$CONFIG_FILE" "$backup"
+  if grep -q '"minClientVer"' "$CONFIG_FILE"; then
+    sed -i 's/"minClientVer"[[:space:]]*:[[:space:]]*"[^"]*"/"minClientVer": "1.0.0"/' "$CONFIG_FILE"
+  else
+    sed -i '/"privateKey"[[:space:]]*:/a\        "minClientVer": "1.0.0",' "$CONFIG_FILE"
+  fi
+  chown root:"$SERVICE_GROUP" "$CONFIG_FILE"
+  chmod 640 "$CONFIG_FILE"
+  if ! "$XRAY_BIN" run -test -c "$CONFIG_FILE"; then
+    install -m640 -o root -g "$SERVICE_GROUP" "$backup" "$CONFIG_FILE"
+    rm -f -- "$backup"
+    yellow "无法写入 REALITY 最低客户端版本，已恢复原配置。"
+    return 1
+  fi
+  rm -f -- "$backup"
+}
+
 update_xray() {
   local current releases choice target index backup
   local -a versions=()
@@ -467,13 +490,16 @@ update_xray() {
 
   backup="$(mktemp -d)"
   cp "$XRAY_BIN" "$backup/xray"
+  cp "$CONFIG_FILE" "$backup/config.json"
   [[ -f "$XRAY_DIR/geoip.dat" ]] && cp "$XRAY_DIR/geoip.dat" "$backup/geoip.dat"
   [[ -f "$XRAY_DIR/geosite.dat" ]] && cp "$XRAY_DIR/geosite.dat" "$backup/geosite.dat"
-  if ! download_xray "$target" ||
+  if ! ensure_min_client_version ||
+     ! download_xray "$target" ||
      ! "$XRAY_BIN" run -test -c "$CONFIG_FILE" ||
      ! service_restart; then
     install -m755 "$backup/xray" "$XRAY_BIN"
     setcap cap_net_bind_service=+ep "$XRAY_BIN"
+    install -m640 -o root -g "$SERVICE_GROUP" "$backup/config.json" "$CONFIG_FILE"
     [[ -f "$backup/geoip.dat" ]] && install -m644 "$backup/geoip.dat" "$XRAY_DIR/geoip.dat"
     [[ -f "$backup/geosite.dat" ]] && install -m644 "$backup/geosite.dat" "$XRAY_DIR/geosite.dat"
     service_restart || true
@@ -482,7 +508,7 @@ update_xray() {
     return 1
   fi
   rm -rf -- "$backup"
-  green "Xray 已更新到 ${target}，节点配置保持不变。"
+  green "Xray 已更新到 ${target}；节点身份和分享链接保持不变，最低客户端版本为 ${MIN_CLIENT_VERSION}。"
 }
 
 update_script() {
