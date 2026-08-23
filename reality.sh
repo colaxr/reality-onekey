@@ -167,7 +167,9 @@ download_xray() {
   [[ -f "${tmp}/geoip.dat" ]] && install -m644 "${tmp}/geoip.dat" "${XRAY_DIR}/geoip.dat"
   [[ -f "${tmp}/geosite.dat" ]] && install -m644 "${tmp}/geosite.dat" "${XRAY_DIR}/geosite.dat"
   rm -rf -- "$tmp"
-  "$XRAY_BIN" version | head -n1
+  # Read the complete output so pipefail cannot turn head's early pipe close
+  # into a false installation failure (Xray prints two version lines).
+  "$XRAY_BIN" version | sed -n '1p'
 }
 
 make_service() {
