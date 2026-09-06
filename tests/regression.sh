@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Mock functions are invoked indirectly by the sourced production functions.
+# shellcheck disable=SC2317
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # shellcheck disable=SC1090

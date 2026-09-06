@@ -15,7 +15,6 @@ readonly RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/lates
 readonly SCRIPT_API_URL="https://api.github.com/repos/colaxr/reality-onekey/contents/reality.sh?ref=main"
 readonly MIN_CLIENT_VERSION="1.0.0"
 
-OS=""
 ARCH=""
 INIT=""
 PKG=""
@@ -36,8 +35,8 @@ detect_system() {
   # shellcheck disable=SC1091
   . /etc/os-release
   case "${ID:-}" in
-    debian|ubuntu) OS="$ID"; PKG="apt"; SERVICE_GROUP="nogroup" ;;
-    alpine) OS="alpine"; PKG="apk"; SERVICE_GROUP="nobody" ;;
+    debian|ubuntu) PKG="apt"; SERVICE_GROUP="nogroup" ;;
+    alpine) PKG="apk"; SERVICE_GROUP="nobody" ;;
     *) die "仅支持 Debian、Ubuntu 和 Alpine（当前：${ID:-unknown}）。" ;;
   esac
   case "$(uname -m)" in
@@ -162,7 +161,8 @@ public_ip() {
 
 download_xray() {
   local tmp version="${1:-}" url
-  tmp="$(mktemp -d)" || return 1
+  # /tmp may be tmpfs; keep the archive and extracted files under /var/tmp.
+  tmp="$(mktemp -d /var/tmp/reality-download.XXXXXX)" || return 1
   if [[ -z "$version" ]]; then
     version="$(curl -fsSL "$RELEASE_API" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)" ||
       { rm -rf -- "$tmp"; return 1; }
@@ -444,6 +444,8 @@ load_node() {
   : "${XUDP_ENABLED:=true}"
 }
 
+# Uppercase node fields are loaded from node.env by load_node.
+# shellcheck disable=SC2153
 show_node() {
   load_node || return 1
   local host link xudp_param="" xudp_status="关闭"
@@ -460,6 +462,7 @@ show_node() {
   green "$link"
 }
 
+# shellcheck disable=SC2153
 edit_node() {
   load_node || return 1
   local server_ip port uuid domain dest short_id fingerprint node_name xudp_enabled private_key
@@ -599,7 +602,7 @@ update_xray() {
     [[ "$choice" =~ ^[Yy]$ ]] || return 0
   fi
 
-  backup="$(mktemp -d)"
+  backup="$(mktemp -d /var/tmp/reality-backup.XXXXXX)" || return 1
   cp "$XRAY_BIN" "$backup/xray"
   cp "$CONFIG_FILE" "$backup/config.json"
   [[ -f "$XRAY_DIR/geoip.dat" ]] && cp "$XRAY_DIR/geoip.dat" "$backup/geoip.dat"
