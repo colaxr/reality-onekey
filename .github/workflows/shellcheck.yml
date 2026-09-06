@@ -12,6 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Bash syntax and regression checks
+        run: |
+          bash -n reality.sh install.sh tests/regression.sh
+          bash tests/regression.sh
       - name: Run ShellCheck
         uses: ludeeus/action-shellcheck@2.0.0
         with:

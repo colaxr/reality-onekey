@@ -55,12 +55,29 @@ detect_system() {
 }
 
 install_dependencies() {
-  if [[ "$PKG" == "apt" ]]; then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y curl unzip ca-certificates openssl libcap2-bin
-  else
-    apk add --no-cache curl unzip ca-certificates openssl libcap
+  local -a missing=()
+  command -v curl >/dev/null 2>&1 || missing+=(curl)
+  command -v unzip >/dev/null 2>&1 || missing+=(unzip)
+  command -v openssl >/dev/null 2>&1 || missing+=(openssl)
+  [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
+  if ! command -v setcap >/dev/null 2>&1; then
+    if [[ "$PKG" == apt ]]; then missing+=(libcap2-bin); else missing+=(libcap); fi
   fi
+  if (( ${#missing[@]} == 0 )); then
+    info "依赖已齐全，跳过软件源更新和依赖安装。"
+    return 0
+  fi
+  info "仅安装缺少的依赖：${missing[*]}"
+  if [[ "$PKG" == "apt" ]]; then
+    # Avoid persistent binary caches and translation indexes on small machines.
+    local -a apt_options=(-o 'Dir::Cache::pkgcache=' -o 'Dir::Cache::srcpkgcache=' -o 'Acquire::Languages=none')
+    apt-get "${apt_options[@]}" update &&
+      DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y --no-install-recommends "${missing[@]}" && return 0
+  else
+    apk add --no-cache "${missing[@]}" && return 0
+  fi
+  yellow "依赖安装失败。若出现 Killed，请检查内存/cgroup 限制及 Swap；依赖安装完成前无法继续。"
+  return 1
 }
 
 prompt() {
@@ -195,8 +212,8 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now "$APP_NAME"
+    systemctl daemon-reload || return 1
+    systemctl enable "$APP_NAME" || return 1
   else
     touch "/var/log/${APP_NAME}.log" "/var/log/${APP_NAME}.err"
     chown nobody:nobody "/var/log/${APP_NAME}.log" "/var/log/${APP_NAME}.err"
@@ -213,9 +230,9 @@ error_log="/var/log/${APP_NAME}.err"
 depend() { need net; }
 EOF
     chmod 755 "$OPENRC_FILE"
-    rc-update add "$APP_NAME" default
-    rc-service "$APP_NAME" restart
+    rc-update add "$APP_NAME" default || return 1
   fi
+  service_restart
 }
 
 service_stop() {
@@ -229,10 +246,61 @@ service_stop() {
 
 service_restart() {
   if [[ "$INIT" == "systemd" ]]; then
-    systemctl restart "$APP_NAME"
+    systemctl restart "$APP_NAME" || return 1
   else
-    rc-service "$APP_NAME" restart
+    rc-service "$APP_NAME" restart || return 1
   fi
+  verify_service
+}
+
+# Match a listening socket to the managed PID, not another process on the port.
+service_listening() {
+  local pid="$1" port="$2" fd socket inode hex
+  printf -v hex '%04X' "$port"
+  for fd in /proc/"$pid"/fd/*; do
+    socket="$(readlink "$fd" 2>/dev/null)" || continue
+    [[ "$socket" == socket:\[*\] ]] || continue
+    inode="${socket#socket:[}"
+    inode="${inode%]}"
+    if awk -v port="$hex" -v inode="$inode" '
+      $4 == "0A" && $10 == inode && $2 ~ (":" port "$") { found=1 }
+      END { exit !found }
+    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+verify_service() {
+  local pid previous="" port attempt stable=0
+  port="$(sed -n 's/.*"port":[[:space:]]*\([0-9]*\).*/\1/p' "$CONFIG_FILE")"
+  validate_port "$port" || return 1
+  info "检查服务进程及 TCP ${port} 监听状态..."
+  for ((attempt=0; attempt<10; attempt++)); do
+    sleep 1
+    if [[ "$INIT" == systemd ]]; then
+      pid="$(systemctl show -p MainPID --value "$APP_NAME" 2>/dev/null)" || pid=""
+    else
+      pid="$(cat "/run/${APP_NAME}.pid" 2>/dev/null)" || pid=""
+    fi
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null &&
+       service_listening "$pid" "$port"; then
+      if [[ "$pid" == "$previous" ]]; then stable=$((stable + 1)); else stable=1; fi
+      previous="$pid"
+      (( stable >= 3 )) && return 0
+    else
+      stable=0
+      previous=""
+    fi
+  done
+  yellow "服务未能持续运行并监听 TCP ${port}，请检查端口冲突和资源限制。"
+  if [[ "$INIT" == systemd ]]; then
+    journalctl -u "$APP_NAME" -n 20 --no-pager || true
+  else
+    tail -n 20 "/var/log/${APP_NAME}.err" "/var/log/${APP_NAME}.log" || true
+  fi
+  return 1
 }
 
 service_status() {
@@ -327,12 +395,16 @@ EOF
 
 install_reality() {
   local port domain dest uuid keys private_key public_key short_id server_ip fingerprint node_name xudp_enabled
-  install_dependencies
+  install_dependencies || die "依赖未就绪。"
   if [[ "$(readlink -f "$0" 2>/dev/null || true)" != "$MANAGER_BIN" ]]; then
     install -Dm755 "$0" "$MANAGER_BIN"
   fi
   ln -sf "$MANAGER_BIN" "$SHORTCUT_BIN"
-  download_xray || die "Xray 下载或安装失败。"
+  if [[ -x "$XRAY_BIN" ]] && "$XRAY_BIN" version >/dev/null 2>&1; then
+    info "复用已安装的 Xray；如需升级或重装，请使用菜单 5。"
+  else
+    download_xray || die "Xray 下载或安装失败。"
+  fi
 
   port="$(prompt "监听端口" "443")"
   validate_port "$port" || die "端口必须是 1-65535 的整数。"
@@ -356,7 +428,7 @@ install_reality() {
   short_id="$(openssl rand -hex 8)"
   write_config "$port" "$uuid" "$domain" "$dest" "$private_key" "$public_key" "$short_id" "$server_ip" "$fingerprint" "$node_name" "$xudp_enabled"
   "$XRAY_BIN" run -test -c "$CONFIG_FILE"
-  make_service
+  make_service || die "节点服务启动检查失败。"
   green "安装完成。请确认云防火墙/安全组已放行 TCP ${port}。"
   show_node
 }
@@ -432,8 +504,15 @@ edit_node() {
     yellow "新配置校验失败，已恢复原配置。"
     return 1
   fi
+  if ! make_service; then
+    cp "$backup_config" "$CONFIG_FILE"
+    cp "$backup_env" "$ENV_FILE"
+    rm -f -- "$backup_config" "$backup_env"
+    yellow "服务启动检查失败，已恢复原节点配置。"
+    service_restart || yellow "原配置也未能启动，请检查上述日志。"
+    return 1
+  fi
   rm -f -- "$backup_config" "$backup_env"
-  make_service
   green "节点配置已修改并重启。请确认已放行 TCP ${port}。"
   show_node
 }
@@ -534,7 +613,7 @@ update_xray() {
     install -m640 -o root -g "$SERVICE_GROUP" "$backup/config.json" "$CONFIG_FILE"
     [[ -f "$backup/geoip.dat" ]] && install -m644 "$backup/geoip.dat" "$XRAY_DIR/geoip.dat"
     [[ -f "$backup/geosite.dat" ]] && install -m644 "$backup/geosite.dat" "$XRAY_DIR/geosite.dat"
-    service_restart || true
+    service_restart || yellow "旧版本文件已恢复，但服务仍无法启动，请检查上述日志。"
     rm -rf -- "$backup"
     yellow "更新失败，已恢复 ${current}。"
     return 1
