@@ -17,6 +17,9 @@ jobs:
           bash -n reality.sh install.sh tests/regression.sh
           bash tests/regression.sh
       - name: Run ShellCheck
-        uses: ludeeus/action-shellcheck@2.0.0
-        with:
-          scandir: "."
+        run: |
+          shellcheck --format=gcc reality.sh install.sh tests/regression.sh > /tmp/shellcheck.txt || result=$?
+          while IFS= read -r line; do
+            printf '::error::%s\n' "$line"
+          done < /tmp/shellcheck.txt
+          exit "${result:-0}"
