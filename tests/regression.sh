@@ -13,7 +13,7 @@ sed() { printf '26996\n'; }
 kill() { return 0; }
 tail() { :; }
 service_listening() { return 0; }
-INIT=openrc
+export INIT=openrc
 verify_service >/dev/null
 service_listening() { return 1; }
 if verify_service >/dev/null; then
@@ -26,7 +26,7 @@ if verify_service >/dev/null; then
 fi
 unset -f cat sed kill tail sleep service_listening
 
-PKG=apt
+export PKG=apt
 command() { return 0; }
 # Certificate bundle path is normally present in Linux CI.
 apt-get() { echo 'FAIL: unnecessary APT invocation' >&2; return 1; }
