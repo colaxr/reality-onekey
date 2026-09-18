@@ -569,16 +569,17 @@ restore_state() {
 
 apply_node_change() {
   local backup="$1" success_message="$2"
-  local candidate
-  candidate="$(mktemp /var/tmp/reality-config.XXXXXX)" || return 1
+  local candidate candidate_dir
+  candidate_dir="$(mktemp -d /var/tmp/reality-config.XXXXXX)" || return 1
+  candidate="${candidate_dir}/config.json"
   if ! rebuild_config "$candidate" || ! "$XRAY_BIN" run -test -c "$candidate"; then
-    rm -f -- "$candidate"
+    rm -rf -- "$candidate_dir"
     restore_state "$backup"
     yellow "新配置校验失败，已恢复原配置。"
     return 1
   fi
   install -m640 -o root -g "$SERVICE_GROUP" "$candidate" "$CONFIG_FILE"
-  rm -f -- "$candidate"
+  rm -rf -- "$candidate_dir"
   chown root:"$SERVICE_GROUP" "$APP_DIR"
   chmod 750 "$APP_DIR"
   if ! make_service; then
@@ -815,17 +816,18 @@ uninstall_reality() {
 }
 
 ensure_min_client_version() {
-  local candidate
+  local candidate candidate_dir
   [[ -r "$CONFIG_FILE" ]] || return 1
   [[ -r "$ENV_FILE" ]] || return 0
-  candidate="$(mktemp /var/tmp/reality-config.XXXXXX)" || return 1
+  candidate_dir="$(mktemp -d /var/tmp/reality-config.XXXXXX)" || return 1
+  candidate="${candidate_dir}/config.json"
   if ! rebuild_config "$candidate" || ! "$XRAY_BIN" run -test -c "$candidate"; then
-    rm -f -- "$candidate"
+    rm -rf -- "$candidate_dir"
     yellow "无法写入 REALITY 最低客户端版本，原配置未修改。"
     return 1
   fi
   install -m640 -o root -g "$SERVICE_GROUP" "$candidate" "$CONFIG_FILE"
-  rm -f -- "$candidate"
+  rm -rf -- "$candidate_dir"
 }
 
 update_xray() {
