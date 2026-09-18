@@ -2,15 +2,17 @@
 set -Eeuo pipefail
 
 readonly APP_NAME="reality-onekey"
-readonly APP_DIR="/etc/${APP_NAME}"
-readonly XRAY_DIR="/usr/local/share/xray"
-readonly XRAY_BIN="/usr/local/bin/xray"
-readonly MANAGER_BIN="/usr/local/bin/reality"
-readonly SHORTCUT_BIN="/usr/local/bin/x"
+readonly ROOT_PREFIX="${REALITY_ROOT_PREFIX:-}"
+readonly APP_DIR="${ROOT_PREFIX}/etc/${APP_NAME}"
+readonly XRAY_DIR="${ROOT_PREFIX}/usr/local/share/xray"
+readonly XRAY_BIN="${ROOT_PREFIX}/usr/local/bin/xray"
+readonly MANAGER_BIN="${ROOT_PREFIX}/usr/local/bin/reality"
+readonly SHORTCUT_BIN="${ROOT_PREFIX}/usr/local/bin/x"
 readonly CONFIG_FILE="${APP_DIR}/config.json"
 readonly ENV_FILE="${APP_DIR}/node.env"
-readonly SYSTEMD_FILE="/etc/systemd/system/${APP_NAME}.service"
-readonly OPENRC_FILE="/etc/init.d/${APP_NAME}"
+readonly SS_ENV_FILE="${APP_DIR}/ss.env"
+readonly SYSTEMD_FILE="${ROOT_PREFIX}/etc/systemd/system/${APP_NAME}.service"
+readonly OPENRC_FILE="${ROOT_PREFIX}/etc/init.d/${APP_NAME}"
 readonly RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 readonly SCRIPT_API_URL="https://api.github.com/repos/colaxr/reality-onekey/contents/reality.sh?ref=main"
 readonly MIN_CLIENT_VERSION="1.0.0"
@@ -135,6 +137,39 @@ validate_node_name() {
   [[ -n "$1" && ${#1} -le 64 && "$1" != *"'"* && "$1" != *$'\n'* && "$1" != *$'\r'* ]]
 }
 
+validate_ss_method() {
+  case "$1" in
+    aes-256-gcm|aes-128-gcm|chacha20-ietf-poly1305|xchacha20-ietf-poly1305) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_password() {
+  [[ -n "$1" && ${#1} -le 256 && "$1" != *$'\n'* && "$1" != *$'\r'* ]]
+}
+
+base64_encode() {
+  printf '%s' "$1" | openssl base64 -A
+}
+
+base64_decode() {
+  printf '%s' "$1" | openssl base64 -d -A
+}
+
+base64url_encode() {
+  base64_encode "$1" | tr '+/' '-_' | tr -d '='
+}
+
+json_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\t'/\\t}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  printf '%s' "$value"
+}
+
 urlencode() {
   local LC_ALL=C value="$1" output="" char hex index
   for ((index = 0; index < ${#value}; index++)); do
@@ -253,30 +288,68 @@ service_restart() {
   verify_service
 }
 
-# Match a listening socket to the managed PID, not another process on the port.
-service_listening() {
-  local pid="$1" port="$2" fd socket inode hex
+# Match a socket to the managed PID, not another process on the same port.
+service_socket() {
+  local pid="$1" port="$2" state="$3" fd socket inode hex
+  shift 3
   printf -v hex '%04X' "$port"
   for fd in /proc/"$pid"/fd/*; do
     socket="$(readlink "$fd" 2>/dev/null)" || continue
     [[ "$socket" == socket:\[*\] ]] || continue
     inode="${socket#socket:[}"
     inode="${inode%]}"
-    if awk -v port="$hex" -v inode="$inode" '
-      $4 == "0A" && $10 == inode && $2 ~ (":" port "$") { found=1 }
+    if awk -v port="$hex" -v inode="$inode" -v state="$state" '
+      $4 == state && $10 == inode && $2 ~ (":" port "$") { found=1 }
       END { exit !found }
-    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+    ' "$@" 2>/dev/null; then
       return 0
     fi
   done
   return 1
 }
 
+service_listening() {
+  service_socket "$1" "$2" 0A /proc/net/tcp /proc/net/tcp6
+}
+
+service_udp_listening() {
+  service_socket "$1" "$2" 07 /proc/net/udp /proc/net/udp6
+}
+
+managed_listeners() {
+  if [[ -r "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    validate_port "${PORT:-}" || return 1
+    printf 'tcp %s\n' "$PORT"
+  fi
+  if [[ -r "$SS_ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    . "$SS_ENV_FILE"
+    validate_port "${SS_PORT:-}" || return 1
+    printf 'tcp %s\nudp %s\n' "$SS_PORT" "$SS_PORT"
+  fi
+}
+
+service_has_all_listeners() {
+  local pid="$1" protocol port found=false
+  while read -r protocol port; do
+    [[ -n "$protocol" ]] || continue
+    found=true
+    if [[ "$protocol" == tcp ]]; then
+      service_listening "$pid" "$port" || return 1
+    else
+      service_udp_listening "$pid" "$port" || return 1
+    fi
+  done < <(managed_listeners)
+  [[ "$found" == true ]]
+}
+
 verify_service() {
-  local pid previous="" port attempt stable=0
-  port="$(sed -n 's/.*"port":[[:space:]]*\([0-9]*\).*/\1/p' "$CONFIG_FILE")"
-  validate_port "$port" || return 1
-  info "检查服务进程及 TCP ${port} 监听状态..."
+  local pid previous="" attempt stable=0 listeners
+  listeners="$(managed_listeners | paste -sd '、' -)" || return 1
+  [[ -n "$listeners" ]] || return 1
+  info "检查服务进程及监听状态：${listeners}"
   for ((attempt=0; attempt<10; attempt++)); do
     sleep 1
     if [[ "$INIT" == systemd ]]; then
@@ -285,7 +358,7 @@ verify_service() {
       pid="$(cat "/run/${APP_NAME}.pid" 2>/dev/null)" || pid=""
     fi
     if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null &&
-       service_listening "$pid" "$port"; then
+       service_has_all_listeners "$pid"; then
       if [[ "$pid" == "$previous" ]]; then stable=$((stable + 1)); else stable=1; fi
       previous="$pid"
       (( stable >= 3 )) && return 0
@@ -294,7 +367,7 @@ verify_service() {
       previous=""
     fi
   done
-  yellow "服务未能持续运行并监听 TCP ${port}，请检查端口冲突和资源限制。"
+  yellow "服务未能持续运行并监听全部 TCP/UDP 端口，请检查端口冲突和资源限制。"
   if [[ "$INIT" == systemd ]]; then
     journalctl -u "$APP_NAME" -n 20 --no-pager || true
   else
@@ -319,61 +392,34 @@ remove_node_files() {
   [[ "$INIT" == "systemd" ]] && systemctl daemon-reload
 }
 
-delete_node() {
-  local answer="${1:-}"
-  [[ -e "$CONFIG_FILE" || -e "$SYSTEMD_FILE" || -e "$OPENRC_FILE" ]] ||
-    { yellow "未发现已安装的节点。"; return; }
-  if [[ "$answer" != "--yes" ]]; then
-    read -r -p "将删除当前节点配置和服务，但保留 Xray 与管理命令，确定吗？[y/N]: " answer
-    [[ "$answer" =~ ^[Yy]$ ]] || { yellow "已取消。"; return; }
+load_reality() {
+  if [[ ! -r "$ENV_FILE" ]]; then
+    [[ "${1:-}" == quiet ]] || yellow "尚未安装 REALITY 节点。"
+    return 1
   fi
-  remove_node_files
-  green "已删除当前节点；Xray 和 reality 管理命令仍保留。"
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  : "${NODE_NAME:=REALITY-${SERVER_IP}}"
+  : "${XUDP_ENABLED:=true}"
 }
 
-write_config() {
-  local port="$1" uuid="$2" domain="$3" dest="$4" private_key="$5" public_key="$6"
-  local short_id="$7" server_ip="$8" fingerprint="${9:-chrome}"
-  local node_name="${10:-REALITY-${server_ip}}"
-  local xudp_enabled="${11:-true}"
-  install -d -m700 "$APP_DIR"
-  cat >"$CONFIG_FILE" <<EOF
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [{
-    "listen": "0.0.0.0",
-    "port": ${port},
-    "protocol": "vless",
-    "settings": {
-      "clients": [{ "id": "${uuid}", "flow": "xtls-rprx-vision" }],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "tcp",
-      "security": "reality",
-      "realitySettings": {
-        "show": false,
-        "target": "${dest}",
-        "xver": 0,
-        "serverNames": ["${domain}"],
-        "privateKey": "${private_key}",
-        "minClientVer": "${MIN_CLIENT_VERSION}",
-        "shortIds": ["${short_id}"]
-      }
-    },
-    "sniffing": {
-      "enabled": true,
-      "destOverride": ["http", "tls", "quic"],
-      "routeOnly": true
-    }
-  }],
-  "outbounds": [
-    { "protocol": "freedom", "tag": "direct" },
-    { "protocol": "blackhole", "tag": "block" }
-  ]
+load_ss() {
+  if [[ ! -r "$SS_ENV_FILE" ]]; then
+    [[ "${1:-}" == quiet ]] || yellow "尚未安装 Shadowsocks 节点。"
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  . "$SS_ENV_FILE"
+  SS_PASSWORD="$(base64_decode "$SS_PASSWORD_B64" 2>/dev/null)" || {
+    yellow "Shadowsocks 密码数据损坏。"
+    return 1
+  }
 }
-EOF
-  chmod 600 "$CONFIG_FILE"
+
+write_reality_env() {
+  local port="$1" uuid="$2" domain="$3" dest="$4" public_key="$6"
+  local short_id="$7" server_ip="$8" fingerprint="$9" node_name="${10}" xudp_enabled="${11}"
+  install -d -m700 "$APP_DIR"
   cat >"$ENV_FILE" <<EOF
 SERVER_IP='${server_ip}'
 PORT='${port}'
@@ -388,13 +434,99 @@ NODE_NAME='${node_name}'
 XUDP_ENABLED='${xudp_enabled}'
 EOF
   chmod 600 "$ENV_FILE"
-  chown root:"$SERVICE_GROUP" "$APP_DIR" "$CONFIG_FILE"
-  chmod 750 "$APP_DIR"
-  chmod 640 "$CONFIG_FILE"
 }
 
-install_reality() {
-  local port domain dest uuid keys private_key public_key short_id server_ip fingerprint node_name xudp_enabled
+write_ss_env() {
+  local server_ip="$1" port="$2" method="$3" password="$4" node_name="$5"
+  install -d -m700 "$APP_DIR"
+  cat >"$SS_ENV_FILE" <<EOF
+SS_SERVER_IP='${server_ip}'
+SS_PORT='${port}'
+SS_METHOD='${method}'
+SS_PASSWORD_B64='$(base64_encode "$password")'
+SS_NODE_NAME='${node_name}'
+SS_NETWORK='tcp,udp'
+EOF
+  chmod 600 "$SS_ENV_FILE"
+}
+
+# Uppercase fields are loaded dynamically from the root-owned node env files.
+# shellcheck disable=SC2153
+rebuild_config() {
+  local output="${1:-$CONFIG_FILE}" comma="" private_key ss_password
+  [[ -r "$ENV_FILE" || -r "$SS_ENV_FILE" ]] || return 1
+  install -d -m700 "$APP_DIR"
+  {
+    printf '{\n  "log": { "loglevel": "warning" },\n  "inbounds": ['
+    if load_reality quiet; then
+      if [[ -n "${PRIVATE_KEY:-}" ]]; then
+        private_key="$PRIVATE_KEY"
+      else
+        private_key="$(sed -n 's/.*"privateKey":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_FILE" 2>/dev/null | sed -n '1p')"
+      fi
+      [[ -n "$private_key" ]] || { yellow "无法读取现有 REALITY 私钥。" >&2; return 1; }
+      cat <<EOF
+{
+    "tag": "reality-in",
+    "listen": "0.0.0.0",
+    "port": ${PORT},
+    "protocol": "vless",
+    "settings": {
+      "clients": [{ "id": "$(json_escape "$UUID")", "flow": "xtls-rprx-vision" }],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "show": false,
+        "target": "$(json_escape "$DEST")",
+        "xver": 0,
+        "serverNames": ["$(json_escape "$SNI")"],
+        "privateKey": "$(json_escape "$private_key")",
+        "minClientVer": "${MIN_CLIENT_VERSION}",
+        "shortIds": ["$(json_escape "$SHORT_ID")"]
+      }
+    },
+    "sniffing": {
+      "enabled": true,
+      "destOverride": ["http", "tls", "quic"],
+      "routeOnly": true
+    }
+  }
+EOF
+      comma=,
+    fi
+    if load_ss quiet; then
+      ss_password="$SS_PASSWORD"
+      printf '%s\n' "$comma"
+      cat <<EOF
+  {
+    "tag": "ss-in",
+    "listen": "0.0.0.0",
+    "port": ${SS_PORT},
+    "protocol": "shadowsocks",
+    "settings": {
+      "network": "tcp,udp",
+      "method": "$(json_escape "$SS_METHOD")",
+      "password": "$(json_escape "$ss_password")"
+    }
+  }
+EOF
+    fi
+    cat <<'EOF'
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct" },
+    { "protocol": "blackhole", "tag": "block" }
+  ]
+}
+EOF
+  } >"$output"
+  chmod 600 "$output"
+}
+
+install_common() {
   install_dependencies || die "依赖未就绪。"
   if [[ "$(readlink -f "$0" 2>/dev/null || true)" != "$MANAGER_BIN" ]]; then
     install -Dm755 "$0" "$MANAGER_BIN"
@@ -405,9 +537,70 @@ install_reality() {
   else
     download_xray || die "Xray 下载或安装失败。"
   fi
+}
+
+ports_conflict() {
+  local protocol="$1" port="$2"
+  if [[ "$protocol" != reality ]] && load_reality quiet && [[ "$PORT" == "$port" ]]; then
+    yellow "端口 ${port} 已被 REALITY 节点使用。"
+    return 0
+  fi
+  if [[ "$protocol" != ss ]] && load_ss quiet && [[ "$SS_PORT" == "$port" ]]; then
+    yellow "端口 ${port} 已被 Shadowsocks 节点使用。"
+    return 0
+  fi
+  return 1
+}
+
+backup_state() {
+  local target="$1"
+  mkdir -p "$target"
+  [[ -d "$APP_DIR" ]] && cp -a "$APP_DIR/." "$target/"
+}
+
+restore_state() {
+  local source="$1"
+  rm -rf -- "$APP_DIR"
+  if [[ -n "$(find "$source" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+    install -d -m700 "$APP_DIR"
+    cp -a "$source/." "$APP_DIR/"
+  fi
+}
+
+apply_node_change() {
+  local backup="$1" success_message="$2"
+  local candidate
+  candidate="$(mktemp /var/tmp/reality-config.XXXXXX)" || return 1
+  if ! rebuild_config "$candidate" || ! "$XRAY_BIN" run -test -c "$candidate"; then
+    rm -f -- "$candidate"
+    restore_state "$backup"
+    yellow "新配置校验失败，已恢复原配置。"
+    return 1
+  fi
+  install -m640 -o root -g "$SERVICE_GROUP" "$candidate" "$CONFIG_FILE"
+  rm -f -- "$candidate"
+  chown root:"$SERVICE_GROUP" "$APP_DIR"
+  chmod 750 "$APP_DIR"
+  if ! make_service; then
+    restore_state "$backup"
+    if [[ -r "$ENV_FILE" || -r "$SS_ENV_FILE" ]]; then
+      service_restart || yellow "原配置也未能启动，请检查上述日志。"
+    else
+      remove_node_files
+    fi
+    yellow "服务启动检查失败，已恢复原节点配置。"
+    return 1
+  fi
+  green "$success_message"
+}
+
+install_reality() {
+  local port domain dest uuid keys private_key public_key short_id server_ip fingerprint node_name xudp_enabled backup
+  install_common
 
   port="$(prompt "监听端口" "443")"
   validate_port "$port" || die "端口必须是 1-65535 的整数。"
+  ports_conflict reality "$port" && return 1
   domain="$(prompt "伪装域名（支持 TLS 1.3，勿填自己的域名）" "www.microsoft.com")"
   validate_domain "$domain" || die "伪装域名格式不正确。"
   dest="$(prompt "目标地址" "${domain}:443")"
@@ -426,28 +619,23 @@ install_reality() {
   public_key="$(printf '%s\n' "$keys" | awk -F': ' 'tolower($1) ~ /(public|password)/ {print $2; exit}')"
   [[ -n "$private_key" && -n "$public_key" ]] || die "生成 REALITY 密钥失败。"
   short_id="$(openssl rand -hex 8)"
-  write_config "$port" "$uuid" "$domain" "$dest" "$private_key" "$public_key" "$short_id" "$server_ip" "$fingerprint" "$node_name" "$xudp_enabled"
-  "$XRAY_BIN" run -test -c "$CONFIG_FILE"
-  make_service || die "节点服务启动检查失败。"
-  green "安装完成。请确认云防火墙/安全组已放行 TCP ${port}。"
-  show_node
-}
-
-load_node() {
-  if [[ ! -r "$ENV_FILE" ]]; then
-    yellow "尚未安装或节点配置不存在。"
+  backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
+  backup_state "$backup"
+  PRIVATE_KEY="$private_key"
+  write_reality_env "$port" "$uuid" "$domain" "$dest" "$private_key" "$public_key" "$short_id" "$server_ip" "$fingerprint" "$node_name" "$xudp_enabled"
+  if apply_node_change "$backup" "REALITY 安装完成。请确认已放行 TCP ${port}。"; then
+    rm -rf -- "$backup"
+    show_reality
+  else
+    rm -rf -- "$backup"
     return 1
   fi
-  # shellcheck disable=SC1090
-  . "$ENV_FILE"
-  : "${NODE_NAME:=REALITY-${SERVER_IP}}"
-  : "${XUDP_ENABLED:=true}"
 }
 
-# Uppercase node fields are loaded from node.env by load_node.
+# Uppercase node fields are loaded from node.env by load_reality.
 # shellcheck disable=SC2153
-show_node() {
-  load_node || return 1
+show_reality() {
+  load_reality || return 1
   local host link xudp_param="" xudp_status="关闭"
   host="$SERVER_IP"
   [[ "$host" == *:* && "$host" != \[*\] ]] && host="[${host}]"
@@ -462,12 +650,66 @@ show_node() {
   green "$link"
 }
 
+select_ss_method() {
+  local current="${1:-aes-256-gcm}" choice
+  printf '\nShadowsocks 加密方式（当前/默认：%s）\n' "$current" >&2
+  printf '1. aes-256-gcm\n2. aes-128-gcm\n3. chacha20-ietf-poly1305\n4. xchacha20-ietf-poly1305\n0. 保持当前/默认\n' >&2
+  read -r -p "请选择 [0-4]: " choice
+  case "$choice" in
+    0|"") printf '%s' "$current" ;;
+    1) printf 'aes-256-gcm' ;;
+    2) printf 'aes-128-gcm' ;;
+    3) printf 'chacha20-ietf-poly1305' ;;
+    4) printf 'xchacha20-ietf-poly1305' ;;
+    *) yellow "无效选项。" >&2; return 1 ;;
+  esac
+}
+
+install_ss() {
+  local server_ip port method password node_name backup
+  install_common
+  server_ip="$(prompt "服务器公网 IP/域名" "$(public_ip)")"
+  validate_server_address "$server_ip" || { yellow "服务器地址格式不正确。"; return 1; }
+  port="$(prompt "监听端口" "8388")"
+  validate_port "$port" || { yellow "端口必须是 1-65535 的整数。"; return 1; }
+  ports_conflict ss "$port" && return 1
+  method="$(select_ss_method aes-256-gcm)" || return 1
+  password="$(prompt "密码（留空自动生成）")"
+  [[ -n "$password" ]] || password="$(openssl rand -base64 24 | tr -d '\n')"
+  validate_password "$password" || { yellow "密码不能为空、不能包含换行，且最长 256 个字符。"; return 1; }
+  node_name="$(prompt "节点名称" "SS-${server_ip}")"
+  validate_node_name "$node_name" || { yellow "节点名称不能为空、不能包含单引号/换行，且最长 64 个字符。"; return 1; }
+  backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
+  backup_state "$backup"
+  write_ss_env "$server_ip" "$port" "$method" "$password" "$node_name"
+  if apply_node_change "$backup" "Shadowsocks 安装完成，TCP 和 UDP 均已启用。请在安全组/防火墙放行 TCP/UDP ${port}。"; then
+    rm -rf -- "$backup"
+    show_ss
+  else
+    rm -rf -- "$backup"
+    return 1
+  fi
+}
+
+show_ss() {
+  load_ss || return 1
+  local host userinfo link
+  host="$SS_SERVER_IP"
+  [[ "$host" == *:* && "$host" != \[*\] ]] && host="[$host]"
+  userinfo="$(base64url_encode "${SS_METHOD}:${SS_PASSWORD}")"
+  link="ss://${userinfo}@${host}:${SS_PORT}#$(urlencode "$SS_NODE_NAME")"
+  printf '\nShadowsocks 节点信息\n'
+  printf '名称：%s\n服务器：%s\n端口：%s\n加密：%s\n网络：TCP + UDP\n密码：%s\n\n' \
+    "$SS_NODE_NAME" "$SS_SERVER_IP" "$SS_PORT" "$SS_METHOD" "$SS_PASSWORD"
+  green "$link"
+}
+
 # shellcheck disable=SC2153
 edit_node() {
-  load_node || return 1
+  load_reality || return 1
   local server_ip port uuid domain dest short_id fingerprint node_name xudp_enabled private_key
-  local backup_config backup_env
-  private_key="$(sed -n 's/.*"privateKey":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_FILE" | head -n1)"
+  local backup
+  private_key="$(sed -n 's/.*"privateKey":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_FILE" | sed -n '1p')"
   if [[ -z "$private_key" ]]; then
     yellow "无法读取现有 REALITY 私钥，配置未修改。"
     return 1
@@ -477,6 +719,7 @@ edit_node() {
   validate_server_address "$server_ip" || { yellow "服务器地址格式不正确。"; return 1; }
   port="$(prompt "监听端口" "$PORT")"
   validate_port "$port" || { yellow "端口必须是 1-65535 的整数。"; return 1; }
+  ports_conflict reality "$port" && return 1
   uuid="$(prompt "UUID" "$UUID")"
   validate_uuid "$uuid" || { yellow "UUID 格式不正确。"; return 1; }
   domain="$(prompt "伪装域名（SNI）" "$SNI")"
@@ -495,63 +738,94 @@ edit_node() {
     { yellow "节点名称不能为空、不能包含单引号/换行，且最长 64 个字符。"; return 1; }
   xudp_enabled="$(prompt_yes_no "启用 XUDP/UDP 支持" "$XUDP_ENABLED")"
 
-  backup_config="$(mktemp)"
-  backup_env="$(mktemp)"
-  cp "$CONFIG_FILE" "$backup_config"
-  cp "$ENV_FILE" "$backup_env"
-  write_config "$port" "$uuid" "$domain" "$dest" "$private_key" "$PUBLIC_KEY" "$short_id" "$server_ip" "$fingerprint" "$node_name" "$xudp_enabled"
-  if ! "$XRAY_BIN" run -test -c "$CONFIG_FILE"; then
-    cp "$backup_config" "$CONFIG_FILE"
-    cp "$backup_env" "$ENV_FILE"
-    rm -f -- "$backup_config" "$backup_env"
-    yellow "新配置校验失败，已恢复原配置。"
+  backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
+  backup_state "$backup"
+  PRIVATE_KEY="$private_key"
+  write_reality_env "$port" "$uuid" "$domain" "$dest" "$private_key" "$PUBLIC_KEY" "$short_id" "$server_ip" "$fingerprint" "$node_name" "$xudp_enabled"
+  if apply_node_change "$backup" "REALITY 节点已修改并重启。请确认已放行 TCP ${port}。"; then
+    rm -rf -- "$backup"
+    show_reality
+  else
+    rm -rf -- "$backup"
     return 1
   fi
-  if ! make_service; then
-    cp "$backup_config" "$CONFIG_FILE"
-    cp "$backup_env" "$ENV_FILE"
-    rm -f -- "$backup_config" "$backup_env"
-    yellow "服务启动检查失败，已恢复原节点配置。"
-    service_restart || yellow "原配置也未能启动，请检查上述日志。"
+}
+
+edit_ss() {
+  load_ss || return 1
+  local server_ip port method password node_name backup
+  server_ip="$(prompt "服务器公网 IP/域名" "$SS_SERVER_IP")"
+  validate_server_address "$server_ip" || { yellow "服务器地址格式不正确。"; return 1; }
+  port="$(prompt "监听端口" "$SS_PORT")"
+  validate_port "$port" || { yellow "端口必须是 1-65535 的整数。"; return 1; }
+  ports_conflict ss "$port" && return 1
+  method="$(select_ss_method "$SS_METHOD")" || return 1
+  password="$(prompt "密码" "$SS_PASSWORD")"
+  validate_password "$password" || { yellow "密码不能为空、不能包含换行，且最长 256 个字符。"; return 1; }
+  node_name="$(prompt "节点名称" "$SS_NODE_NAME")"
+  validate_node_name "$node_name" || { yellow "节点名称格式不正确。"; return 1; }
+  backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
+  backup_state "$backup"
+  write_ss_env "$server_ip" "$port" "$method" "$password" "$node_name"
+  if apply_node_change "$backup" "Shadowsocks 节点已修改，TCP 和 UDP 均已启用。"; then
+    rm -rf -- "$backup"
+    show_ss
+  else
+    rm -rf -- "$backup"
     return 1
   fi
-  rm -f -- "$backup_config" "$backup_env"
-  green "节点配置已修改并重启。请确认已放行 TCP ${port}。"
-  show_node
+}
+
+delete_protocol() {
+  local protocol="$1" answer="${2:-}" file label backup
+  if [[ "$protocol" == reality ]]; then file="$ENV_FILE"; label=REALITY; else file="$SS_ENV_FILE"; label=Shadowsocks; fi
+  [[ -r "$file" ]] || { yellow "尚未安装 ${label} 节点。"; return 1; }
+  if [[ "$answer" != --yes ]]; then
+    read -r -p "将删除 ${label} 节点，其他协议节点会保留，确定吗？[y/N]: " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || { yellow "已取消。"; return 0; }
+  fi
+  backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
+  backup_state "$backup"
+  rm -f -- "$file"
+  if [[ ! -r "$ENV_FILE" && ! -r "$SS_ENV_FILE" ]]; then
+    remove_node_files
+    rm -rf -- "$backup"
+    green "已删除 ${label} 节点；当前没有其他节点，服务已移除，Xray 和管理命令仍保留。"
+    return 0
+  fi
+  if apply_node_change "$backup" "已删除 ${label} 节点，其他节点继续运行。"; then
+    rm -rf -- "$backup"
+  else
+    rm -rf -- "$backup"
+    return 1
+  fi
 }
 
 uninstall_reality() {
   local answer="${1:-}"
   if [[ "$answer" != "--yes" ]]; then
-    read -r -p "将完全删除 Xray、REALITY 配置、服务和日志，确定吗？[y/N]: " answer
+    read -r -p "将完全删除 Xray、REALITY/SS 配置、服务和日志，确定吗？[y/N]: " answer
     [[ "$answer" =~ ^[Yy]$ ]] || { yellow "已取消。"; return; }
   fi
   remove_node_files
   rm -f -- "$XRAY_BIN" "$SHORTCUT_BIN" "$MANAGER_BIN"
   rm -rf -- "$XRAY_DIR"
-  green "已完全卸载 REALITY One-key。"
+  green "已完全卸载 REALITY One-key 及全部节点。"
   exit 0
 }
 
 ensure_min_client_version() {
-  local backup
+  local candidate
   [[ -r "$CONFIG_FILE" ]] || return 1
-  backup="$(mktemp)" || return 1
-  cp "$CONFIG_FILE" "$backup"
-  if grep -q '"minClientVer"' "$CONFIG_FILE"; then
-    sed -i 's/"minClientVer"[[:space:]]*:[[:space:]]*"[^"]*"/"minClientVer": "1.0.0"/' "$CONFIG_FILE"
-  else
-    sed -i '/"privateKey"[[:space:]]*:/a\        "minClientVer": "1.0.0",' "$CONFIG_FILE"
-  fi
-  chown root:"$SERVICE_GROUP" "$CONFIG_FILE"
-  chmod 640 "$CONFIG_FILE"
-  if ! "$XRAY_BIN" run -test -c "$CONFIG_FILE"; then
-    install -m640 -o root -g "$SERVICE_GROUP" "$backup" "$CONFIG_FILE"
-    rm -f -- "$backup"
-    yellow "无法写入 REALITY 最低客户端版本，已恢复原配置。"
+  [[ -r "$ENV_FILE" ]] || return 0
+  candidate="$(mktemp /var/tmp/reality-config.XXXXXX)" || return 1
+  if ! rebuild_config "$candidate" || ! "$XRAY_BIN" run -test -c "$candidate"; then
+    rm -f -- "$candidate"
+    yellow "无法写入 REALITY 最低客户端版本，原配置未修改。"
     return 1
   fi
-  rm -f -- "$backup"
+  install -m640 -o root -g "$SERVICE_GROUP" "$candidate" "$CONFIG_FILE"
+  rm -f -- "$candidate"
 }
 
 update_xray() {
@@ -622,7 +896,11 @@ update_xray() {
     return 1
   fi
   rm -rf -- "$backup"
-  green "Xray 已更新到 ${target}；节点身份和分享链接保持不变，最低客户端版本为 ${MIN_CLIENT_VERSION}。"
+  if [[ -r "$ENV_FILE" ]]; then
+    green "Xray 已更新到 ${target}；全部节点身份和分享链接保持不变，REALITY 最低客户端版本为 ${MIN_CLIENT_VERSION}。"
+  else
+    green "Xray 已更新到 ${target}；Shadowsocks 节点身份和分享链接保持不变。"
+  fi
 }
 
 update_script() {
@@ -653,19 +931,39 @@ update_script() {
   exec "$MANAGER_BIN" menu </dev/tty
 }
 
+protocol_menu() {
+  local action="$1" choice
+  while true; do
+    printf '\n请选择节点类型\n1. REALITY\n2. Shadowsocks（SS，TCP + UDP）\n0. 返回主菜单\n'
+    read -r -p "请选择 [0-2]: " choice
+    case "${action}:${choice}" in
+      install:1) install_reality || true; return ;;
+      install:2) install_ss || true; return ;;
+      edit:1) edit_node || true; return ;;
+      edit:2) edit_ss || true; return ;;
+      show:1) show_reality || true; return ;;
+      show:2) show_ss || true; return ;;
+      delete:1) delete_protocol reality || true; return ;;
+      delete:2) delete_protocol ss || true; return ;;
+      *:0) return ;;
+      *) yellow "无效选项。" ;;
+    esac
+  done
+}
+
 menu() {
   while true; do
     printf '\nREALITY 一键管理脚本\n'
     printf '1. 安装/重新配置\n2. 修改节点配置\n3. 查询节点\n4. 查看服务状态\n5. 更新 Xray\n6. 更新管理脚本\n7. 删除已安装节点\n8. 完全卸载\n0. 退出\n'
     read -r -p "请选择 [0-8]: " choice
     case "$choice" in
-      1) install_reality ;;
-      2) edit_node || true ;;
-      3) show_node || true ;;
+      1) protocol_menu install ;;
+      2) protocol_menu edit ;;
+      3) protocol_menu show ;;
       4) service_status ;;
       5) update_xray || true ;;
       6) update_script || true ;;
-      7) delete_node ;;
+      7) protocol_menu delete ;;
       8) uninstall_reality ;;
       0) exit 0 ;;
       *) yellow "无效选项。" ;;
@@ -680,17 +978,25 @@ main() {
   fi
   detect_system
   case "${1:-menu}" in
-    install) install_reality ;;
-    edit) edit_node ;;
-    show) show_node ;;
+    install) protocol_menu install ;;
+    install-reality) install_reality ;;
+    install-ss) install_ss ;;
+    edit) protocol_menu edit ;;
+    edit-reality) edit_node ;;
+    edit-ss) edit_ss ;;
+    show) protocol_menu show ;;
+    show-reality) show_reality ;;
+    show-ss) show_ss ;;
     status) service_status ;;
     update) update_xray ;;
     self-update) update_script ;;
-    remove-node) delete_node "${2:-}" ;;
+    remove-node) protocol_menu delete ;;
+    remove-reality) delete_protocol reality "${2:-}" ;;
+    remove-ss) delete_protocol ss "${2:-}" ;;
     uninstall) uninstall_reality "${2:-}" ;;
     menu) menu ;;
     -h|--help)
-      printf '用法: %s [install|edit|show|status|update|self-update|remove-node [--yes]|uninstall [--yes]|menu]\n' "$0"
+      printf '用法: %s [install|install-reality|install-ss|edit|edit-reality|edit-ss|show|show-reality|show-ss|status|update|self-update|remove-node|remove-reality [--yes]|remove-ss [--yes]|uninstall [--yes]|menu]\n' "$0"
       ;;
     *) die "未知命令：$1" ;;
   esac
