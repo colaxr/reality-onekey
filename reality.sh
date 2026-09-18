@@ -934,22 +934,58 @@ update_script() {
 }
 
 protocol_menu() {
-  local action="$1" choice
+  local action="$1" choice index selected
+  local -a protocols=() labels=()
+  if [[ "$action" == install ]]; then
+    while true; do
+      printf '\n请选择节点类型\n1. REALITY\n2. Shadowsocks（SS，TCP + UDP）\n0. 返回主菜单\n'
+      read -r -p "请选择 [0-2]: " choice
+      case "$choice" in
+        1) install_reality || true; return ;;
+        2) install_ss || true; return ;;
+        0) return ;;
+        *) yellow "无效选项。" ;;
+      esac
+    done
+  fi
+
+  if [[ -r "$ENV_FILE" ]]; then
+    protocols+=(reality)
+    labels+=(REALITY)
+  fi
+  if [[ -r "$SS_ENV_FILE" ]]; then
+    protocols+=(ss)
+    labels+=("Shadowsocks（SS，TCP + UDP）")
+  fi
+  if (( ${#protocols[@]} == 0 )); then
+    yellow "未发现已安装的节点。"
+    return 0
+  fi
+
   while true; do
-    printf '\n请选择节点类型\n1. REALITY\n2. Shadowsocks（SS，TCP + UDP）\n0. 返回主菜单\n'
-    read -r -p "请选择 [0-2]: " choice
-    case "${action}:${choice}" in
-      install:1) install_reality || true; return ;;
-      install:2) install_ss || true; return ;;
-      edit:1) edit_node || true; return ;;
-      edit:2) edit_ss || true; return ;;
-      show:1) show_reality || true; return ;;
-      show:2) show_ss || true; return ;;
-      delete:1) delete_protocol reality || true; return ;;
-      delete:2) delete_protocol ss || true; return ;;
-      *:0) return ;;
-      *) yellow "无效选项。" ;;
+    printf '\n请选择已安装的节点\n'
+    for index in "${!labels[@]}"; do
+      printf '%d. %s\n' "$((index + 1))" "${labels[$index]}"
+    done
+    printf '0. 返回主菜单\n'
+    read -r -p "请选择 [0-${#protocols[@]}]: " choice
+    [[ "$choice" == 0 ]] && return 0
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] ||
+       (( choice < 1 || choice > ${#protocols[@]} )); then
+      yellow "无效选项。"
+      continue
+    fi
+    selected="${protocols[$((choice - 1))]}"
+    case "${action}:${selected}" in
+      edit:reality) edit_node || true ;;
+      edit:ss) edit_ss || true ;;
+      show:reality) show_reality || true ;;
+      show:ss) show_ss || true ;;
+      delete:reality) delete_protocol reality || true ;;
+      delete:ss) delete_protocol ss || true ;;
+      *) yellow "无效操作。" ;;
     esac
+    return 0
   done
 }
 

@@ -82,5 +82,10 @@ mv "$TEST_ROOT/reality.env" "$ENV_FILE"
 rm -f -- "$SS_ENV_FILE"
 rebuild_config "$CONFIG_FILE.reality-only"
 node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if(c.inbounds.length!==1 || c.inbounds[0].tag!=="reality-in") process.exit(1)' "$CONFIG_FILE.reality-only"
+show_reality() { printf 'SHOW_REALITY\n'; }
+menu_output="$(printf '1\n' | protocol_menu show)"
+[[ "$menu_output" == *'1. REALITY'* && "$menu_output" != *'Shadowsocks'* && "$menu_output" == *'SHOW_REALITY'* ]] || {
+  echo 'FAIL: installed-node submenu is not dynamic'; exit 1;
+}
 unset -f chmod install
 echo 'Regression checks passed'
