@@ -59,7 +59,7 @@ if service_socket 42 41996 0A "$PROC_ROOT/net/tcp" "$PROC_ROOT/net/tcp6"; then
   echo 'FAIL: restricted fallback accepted missing port'; exit 1
 fi
 
-# Partial fd access is not enough to relax ownership on a normal host.
+# Partial fd access with an explicit permission denial also needs fallback.
 : >"$PROC_ROOT/42/fd/8"
 readlink() {
   if [[ "$1" == */8 ]]; then printf 'socket:[1234]\n'; return 0; fi
@@ -68,10 +68,10 @@ readlink() {
 }
 printf '0: 00000000:A40C 00000000:0000 0A 0 0 0 0 0 5678\n' >"$PROC_ROOT/net/tcp"
 SERVICE_FALLBACK_USED=false
-if service_socket 42 41996 0A "$PROC_ROOT/net/tcp" "$PROC_ROOT/net/tcp6"; then
-  echo 'FAIL: fallback accepted another process listener with readable fds'; exit 1
-fi
-[[ "$SERVICE_FALLBACK_USED" == false ]] || { echo 'FAIL: partial access used fallback'; exit 1; }
+service_socket 42 41996 0A "$PROC_ROOT/net/tcp" "$PROC_ROOT/net/tcp6" || {
+  echo 'FAIL: partial fd denial blocked fallback'; exit 1;
+}
+[[ "$SERVICE_FALLBACK_USED" == true ]] || { echo 'FAIL: partial access did not use fallback'; exit 1; }
 unset -f readlink
 
 export PKG=apt

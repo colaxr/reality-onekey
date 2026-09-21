@@ -292,13 +292,12 @@ service_restart() {
 # Match a socket to the managed PID, not another process on the same port.
 service_socket() {
   local pid="$1" port="$2" state="$3" fd socket inode hex
-  local readable=false denied=false
+  local denied=false
   shift 3
   printf -v hex '%04X' "$port"
   for fd in "$PROC_ROOT/$pid/fd/"*; do
-    [[ -L "$fd" || -e "$fd" ]] || continue
     if socket="$(LC_ALL=C readlink "$fd" 2>&1)"; then
-      readable=true
+      :
     else
       case "$socket" in
         *"Permission denied"*|*"Operation not permitted"*) denied=true ;;
@@ -315,9 +314,9 @@ service_socket() {
       return 0
     fi
   done
-  # Some containers deny even root access to another user's fd symlinks.
-  # Only in that case, fall back to a stable managed PID plus the port table.
-  if [[ "$denied" == true && "$readable" == false ]] &&
+  # Some containers deny root access to some or all of another user's fd
+  # symlinks. Fully readable hosts still require the inode ownership match.
+  if [[ "$denied" == true ]] &&
      awk -v port="$hex" -v state="$state" '
        $4 == state && $2 ~ (":" port "$") { found=1 }
        END { exit !found }
@@ -384,7 +383,7 @@ verify_service() {
       previous="$pid"
       if (( stable >= 3 )); then
         [[ "$SERVICE_FALLBACK_USED" == true ]] &&
-          yellow "当前环境禁止读取 Xray 进程 fd，已改用稳定 PID 与端口监听的备用检查。"
+          yellow "当前环境限制读取 Xray 进程 fd，已改用稳定 PID 与端口监听的备用检查。"
         return 0
       fi
     else
