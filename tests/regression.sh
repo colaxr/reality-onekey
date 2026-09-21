@@ -77,7 +77,11 @@ fi
 unset -f readlink
 
 # Restricted containers can list fd entries but cannot read any symlink target.
-readlink() { printf 'readlink: Permission denied\n' >&2; return 1; }
+readlink() {
+  # GNU readlink is silent on errors unless verbose mode is requested.
+  [[ "$1" != -v ]] || printf 'readlink: Permission denied\n' >&2
+  return 1
+}
 SERVICE_FALLBACK_USED=false
 service_socket 42 41996 0A "$PROC_ROOT/net/tcp" "$PROC_ROOT/net/tcp6" || {
   echo 'FAIL: restricted container listener rejected'; exit 1;
@@ -91,8 +95,8 @@ fi
 # Partial fd access with an explicit permission denial also needs fallback.
 : >"$PROC_ROOT/42/fd/8"
 readlink() {
-  if [[ "$1" == */8 ]]; then printf 'socket:[1234]\n'; return 0; fi
-  printf 'readlink: Permission denied\n' >&2
+  if [[ "${!#}" == */8 ]]; then printf 'socket:[1234]\n'; return 0; fi
+  [[ "$1" != -v ]] || printf 'readlink: Permission denied\n' >&2
   return 1
 }
 printf '0: 00000000:A40C 00000000:0000 0A 0 0 0 0 0 5678\n' >"$PROC_ROOT/net/tcp"
@@ -102,6 +106,20 @@ service_socket 42 41996 0A "$PROC_ROOT/net/tcp" "$PROC_ROOT/net/tcp6" || {
 }
 [[ "$SERVICE_FALLBACK_USED" == true ]] || { echo 'FAIL: partial access did not use fallback'; exit 1; }
 unset -f readlink
+
+# Real Linux permission failure: retain directory listing but deny traversal.
+# This catches readlink's default silent behavior without mocking its output.
+if [[ "$(uname -s)" == Linux && "$EUID" != 0 ]]; then
+  ln -s 'socket:[1234]' "$PROC_ROOT/42/fd/9"
+  chmod 400 "$PROC_ROOT/42/fd"
+  SERVICE_FALLBACK_USED=false
+  if ! service_socket 42 41996 0A "$PROC_ROOT/net/tcp" "$PROC_ROOT/net/tcp6"; then
+    chmod 700 "$PROC_ROOT/42/fd"
+    echo 'FAIL: real readlink permission denial blocked fallback'; exit 1
+  fi
+  chmod 700 "$PROC_ROOT/42/fd"
+  [[ "$SERVICE_FALLBACK_USED" == true ]] || { echo 'FAIL: real permission fallback not recorded'; exit 1; }
+fi
 
 export PKG=apt
 command() { return 0; }

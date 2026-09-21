@@ -292,13 +292,15 @@ service_restart() {
 # Match a socket to the managed PID, not another process on the same port.
 service_socket() {
   local pid="$1" port="$2" state="$3" fd socket inode hex
-  local denied=false
+  local denied=false fd_error=""
   shift 3
   printf -v hex '%04X' "$port"
   for fd in "$PROC_ROOT/$pid/fd/"*; do
-    if socket="$(LC_ALL=C readlink "$fd" 2>&1)"; then
+    # GNU readlink suppresses errors by default; -v is required to detect EACCES.
+    if socket="$(LC_ALL=C readlink -v "$fd" 2>&1)"; then
       :
     else
+      fd_error="$socket"
       case "$socket" in
         *"Permission denied"*|*"Operation not permitted"*) denied=true ;;
       esac
@@ -324,6 +326,7 @@ service_socket() {
     SERVICE_FALLBACK_USED=true
     return 0
   fi
+  SERVICE_CHECK_REASON="PID=${pid}，端口=${port}，监听状态=${state}：未确认监听归属；fd 权限受限=${denied}；readlink=${fd_error:-无错误}"
   return 1
 }
 
@@ -365,13 +368,17 @@ service_has_all_listeners() {
 }
 
 service_pid_alive() {
-  local pid="$1"
+  local pid="$1" active
   if [[ "$INIT" == systemd ]]; then
     # systemd owns MainPID; kill -0 may be denied in an unprivileged container.
-    [[ "$(systemctl show -p ActiveState --value "$APP_NAME" 2>/dev/null)" == active ]]
+    active="$(systemctl show -p ActiveState --value "$APP_NAME" 2>/dev/null)" || active="unknown"
+    [[ "$active" == active ]] && return 0
+    SERVICE_CHECK_REASON="PID=${pid}，systemd ActiveState=${active}"
   else
-    kill -0 "$pid" 2>/dev/null
+    kill -0 "$pid" 2>/dev/null && return 0
+    SERVICE_CHECK_REASON="PID=${pid}：进程已退出或无权检查其存活状态"
   fi
+  return 1
 }
 
 verify_service() {
@@ -387,10 +394,12 @@ verify_service() {
     else
       pid="$(cat "/run/${APP_NAME}.pid" 2>/dev/null)" || pid=""
     fi
+    SERVICE_CHECK_REASON="服务 PID 无效：${pid:-空}"
     if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && service_pid_alive "$pid" &&
        service_has_all_listeners "$pid"; then
       if [[ "$pid" == "$previous" ]]; then stable=$((stable + 1)); else stable=1; fi
       previous="$pid"
+      SERVICE_CHECK_REASON="PID=${pid}：监听检查通过，连续稳定 ${stable}/3 次"
       if (( stable >= 3 )); then
         [[ "$SERVICE_FALLBACK_USED" == true ]] &&
           yellow "当前环境限制读取 Xray 进程 fd，已改用稳定 PID 与端口监听的备用检查。"
@@ -402,6 +411,7 @@ verify_service() {
     fi
   done
   yellow "服务未能持续运行并监听全部 TCP/UDP 端口，请检查端口冲突和资源限制。"
+  yellow "最后一次检查：${SERVICE_CHECK_REASON}"
   if [[ "$INIT" == systemd ]]; then
     journalctl -u "$APP_NAME" -n 20 --no-pager || true
   else
