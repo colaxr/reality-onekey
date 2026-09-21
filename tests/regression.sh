@@ -30,6 +30,35 @@ if verify_service >/dev/null; then
 fi
 unset -f cat kill tail sleep managed_listeners service_listening
 
+# systemd's ActiveState/MainPID remains usable when container permissions
+# reject kill -0 against the nobody-owned Xray process.
+export INIT=systemd
+systemctl() {
+  case "$*" in
+    *MainPID*) printf '42\n' ;;
+    *ActiveState*) printf 'active\n' ;;
+    *) return 1 ;;
+  esac
+}
+kill() { return 1; }
+cat() { printf '42\n'; }
+sleep() { :; }
+managed_listeners() { printf 'tcp 26996\n'; }
+service_listening() { return 0; }
+journalctl() { :; }
+verify_service >/dev/null || { echo 'FAIL: systemd active PID rejected when kill is denied'; exit 1; }
+systemctl() {
+  case "$*" in
+    *MainPID*) printf '42\n' ;;
+    *ActiveState*) printf 'inactive\n' ;;
+    *) return 1 ;;
+  esac
+}
+if verify_service >/dev/null; then
+  echo 'FAIL: inactive systemd service accepted'; exit 1
+fi
+unset -f systemctl kill cat sleep managed_listeners service_listening journalctl
+
 # Normal hosts require the listening socket inode to belong to the managed PID.
 mkdir -p "$PROC_ROOT/42/fd" "$PROC_ROOT/net"
 : >"$PROC_ROOT/42/fd/7"

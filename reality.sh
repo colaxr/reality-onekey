@@ -364,6 +364,16 @@ service_has_all_listeners() {
   [[ "$found" == true ]]
 }
 
+service_pid_alive() {
+  local pid="$1"
+  if [[ "$INIT" == systemd ]]; then
+    # systemd owns MainPID; kill -0 may be denied in an unprivileged container.
+    [[ "$(systemctl show -p ActiveState --value "$APP_NAME" 2>/dev/null)" == active ]]
+  else
+    kill -0 "$pid" 2>/dev/null
+  fi
+}
+
 verify_service() {
   local pid previous="" attempt stable=0 listeners
   SERVICE_FALLBACK_USED=false
@@ -377,7 +387,7 @@ verify_service() {
     else
       pid="$(cat "/run/${APP_NAME}.pid" 2>/dev/null)" || pid=""
     fi
-    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null &&
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && service_pid_alive "$pid" &&
        service_has_all_listeners "$pid"; then
       if [[ "$pid" == "$previous" ]]; then stable=$((stable + 1)); else stable=1; fi
       previous="$pid"
