@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 readonly APP_NAME="reality-onekey"
 readonly ROOT_PREFIX="${REALITY_ROOT_PREFIX:-}"
+readonly PROC_ROOT="${REALITY_PROC_ROOT:-/proc}"
 readonly APP_DIR="${ROOT_PREFIX}/etc/${APP_NAME}"
 readonly XRAY_DIR="${ROOT_PREFIX}/usr/local/share/xray"
 readonly XRAY_BIN="${ROOT_PREFIX}/usr/local/bin/xray"
@@ -291,10 +292,19 @@ service_restart() {
 # Match a socket to the managed PID, not another process on the same port.
 service_socket() {
   local pid="$1" port="$2" state="$3" fd socket inode hex
+  local readable=false denied=false
   shift 3
   printf -v hex '%04X' "$port"
-  for fd in /proc/"$pid"/fd/*; do
-    socket="$(readlink "$fd" 2>/dev/null)" || continue
+  for fd in "$PROC_ROOT/$pid/fd/"*; do
+    [[ -L "$fd" || -e "$fd" ]] || continue
+    if socket="$(LC_ALL=C readlink "$fd" 2>&1)"; then
+      readable=true
+    else
+      case "$socket" in
+        *"Permission denied"*|*"Operation not permitted"*) denied=true ;;
+      esac
+      continue
+    fi
     [[ "$socket" == socket:\[*\] ]] || continue
     inode="${socket#socket:[}"
     inode="${inode%]}"
@@ -305,15 +315,25 @@ service_socket() {
       return 0
     fi
   done
+  # Some containers deny even root access to another user's fd symlinks.
+  # Only in that case, fall back to a stable managed PID plus the port table.
+  if [[ "$denied" == true && "$readable" == false ]] &&
+     awk -v port="$hex" -v state="$state" '
+       $4 == state && $2 ~ (":" port "$") { found=1 }
+       END { exit !found }
+     ' "$@" 2>/dev/null; then
+    SERVICE_FALLBACK_USED=true
+    return 0
+  fi
   return 1
 }
 
 service_listening() {
-  service_socket "$1" "$2" 0A /proc/net/tcp /proc/net/tcp6
+  service_socket "$1" "$2" 0A "$PROC_ROOT/net/tcp" "$PROC_ROOT/net/tcp6"
 }
 
 service_udp_listening() {
-  service_socket "$1" "$2" 07 /proc/net/udp /proc/net/udp6
+  service_socket "$1" "$2" 07 "$PROC_ROOT/net/udp" "$PROC_ROOT/net/udp6"
 }
 
 managed_listeners() {
@@ -347,6 +367,7 @@ service_has_all_listeners() {
 
 verify_service() {
   local pid previous="" attempt stable=0 listeners
+  SERVICE_FALLBACK_USED=false
   listeners="$(managed_listeners | paste -sd '、' -)" || return 1
   [[ -n "$listeners" ]] || return 1
   info "检查服务进程及监听状态：${listeners}"
@@ -361,7 +382,11 @@ verify_service() {
        service_has_all_listeners "$pid"; then
       if [[ "$pid" == "$previous" ]]; then stable=$((stable + 1)); else stable=1; fi
       previous="$pid"
-      (( stable >= 3 )) && return 0
+      if (( stable >= 3 )); then
+        [[ "$SERVICE_FALLBACK_USED" == true ]] &&
+          yellow "当前环境禁止读取 Xray 进程 fd，已改用稳定 PID 与端口监听的备用检查。"
+        return 0
+      fi
     else
       stable=0
       previous=""

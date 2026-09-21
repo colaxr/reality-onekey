@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 TEST_ROOT="$(mktemp -d)"
 export REALITY_ROOT_PREFIX="$TEST_ROOT"
+export REALITY_PROC_ROOT="$TEST_ROOT/proc"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 # shellcheck disable=SC1090
 source <(sed '$d' reality.sh)
@@ -28,6 +29,50 @@ if verify_service >/dev/null; then
   echo 'FAIL: dead process accepted'; exit 1
 fi
 unset -f cat kill tail sleep managed_listeners service_listening
+
+# Normal hosts require the listening socket inode to belong to the managed PID.
+mkdir -p "$PROC_ROOT/42/fd" "$PROC_ROOT/net"
+: >"$PROC_ROOT/42/fd/7"
+readlink() { printf 'socket:[1234]\n'; }
+printf '0: 00000000:A40C 00000000:0000 0A 0 0 0 0 0 1234\n' >"$PROC_ROOT/net/tcp"
+: >"$PROC_ROOT/net/tcp6"
+SERVICE_FALLBACK_USED=false
+service_socket 42 41996 0A "$PROC_ROOT/net/tcp" "$PROC_ROOT/net/tcp6" || {
+  echo 'FAIL: owned TCP listener rejected'; exit 1;
+}
+[[ "$SERVICE_FALLBACK_USED" == false ]] || { echo 'FAIL: normal host used fallback'; exit 1; }
+printf '0: 00000000:A40C 00000000:0000 0A 0 0 0 0 0 5678\n' >"$PROC_ROOT/net/tcp"
+if service_socket 42 41996 0A "$PROC_ROOT/net/tcp" "$PROC_ROOT/net/tcp6"; then
+  echo 'FAIL: another process listener accepted on normal host'; exit 1
+fi
+unset -f readlink
+
+# Restricted containers can list fd entries but cannot read any symlink target.
+readlink() { printf 'readlink: Permission denied\n' >&2; return 1; }
+SERVICE_FALLBACK_USED=false
+service_socket 42 41996 0A "$PROC_ROOT/net/tcp" "$PROC_ROOT/net/tcp6" || {
+  echo 'FAIL: restricted container listener rejected'; exit 1;
+}
+[[ "$SERVICE_FALLBACK_USED" == true ]] || { echo 'FAIL: restricted fallback not recorded'; exit 1; }
+printf '0: 00000000:A40D 00000000:0000 0A 0 0 0 0 0 5678\n' >"$PROC_ROOT/net/tcp"
+if service_socket 42 41996 0A "$PROC_ROOT/net/tcp" "$PROC_ROOT/net/tcp6"; then
+  echo 'FAIL: restricted fallback accepted missing port'; exit 1
+fi
+
+# Partial fd access is not enough to relax ownership on a normal host.
+: >"$PROC_ROOT/42/fd/8"
+readlink() {
+  if [[ "$1" == */8 ]]; then printf 'socket:[1234]\n'; return 0; fi
+  printf 'readlink: Permission denied\n' >&2
+  return 1
+}
+printf '0: 00000000:A40C 00000000:0000 0A 0 0 0 0 0 5678\n' >"$PROC_ROOT/net/tcp"
+SERVICE_FALLBACK_USED=false
+if service_socket 42 41996 0A "$PROC_ROOT/net/tcp" "$PROC_ROOT/net/tcp6"; then
+  echo 'FAIL: fallback accepted another process listener with readable fds'; exit 1
+fi
+[[ "$SERVICE_FALLBACK_USED" == false ]] || { echo 'FAIL: partial access used fallback'; exit 1; }
+unset -f readlink
 
 export PKG=apt
 command() { return 0; }
