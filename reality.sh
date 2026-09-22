@@ -280,7 +280,23 @@ service_stop() {
   fi
 }
 
+restore_config_permissions() {
+  [[ -d "$APP_DIR" && -f "$CONFIG_FILE" ]] || return 1
+  chown root:"$SERVICE_GROUP" "$APP_DIR" "$CONFIG_FILE" || return 1
+  chmod 750 "$APP_DIR" || return 1
+  chmod 640 "$CONFIG_FILE" || return 1
+  local file
+  for file in "$ENV_FILE" "$SS_ENV_FILE"; do
+    [[ -f "$file" ]] || continue
+    chown root:root "$file" && chmod 600 "$file" || return 1
+  done
+}
+
 service_restart() {
+  restore_config_permissions || {
+    yellow "无法恢复配置读取权限，未重启服务。"
+    return 1
+  }
   if [[ "$INIT" == "systemd" ]]; then
     systemctl restart "$APP_NAME" || return 1
   else
@@ -499,7 +515,8 @@ EOF
 rebuild_config() {
   local output="${1:-$CONFIG_FILE}" comma="" private_key ss_password
   [[ -r "$ENV_FILE" || -r "$SS_ENV_FILE" ]] || return 1
-  install -d -m700 "$APP_DIR"
+  # Rendering a candidate must not change permissions of the live directory.
+  [[ -d "$APP_DIR" ]] || install -d -m700 "$APP_DIR" || return 1
   {
     printf '{\n  "log": { "loglevel": "warning" },\n  "inbounds": ['
     if load_reality quiet; then
@@ -607,7 +624,10 @@ restore_state() {
   rm -rf -- "$APP_DIR"
   if [[ -n "$(find "$source" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
     install -d -m700 "$APP_DIR"
-    cp -a "$source/." "$APP_DIR/"
+    cp -a "$source/." "$APP_DIR/" || return 1
+    if [[ -f "$CONFIG_FILE" ]]; then
+      restore_config_permissions || return 1
+    fi
   fi
 }
 
@@ -618,16 +638,14 @@ apply_node_change() {
   candidate="${candidate_dir}/config.json"
   if ! rebuild_config "$candidate" || ! "$XRAY_BIN" run -test -c "$candidate"; then
     rm -rf -- "$candidate_dir"
-    restore_state "$backup"
+    restore_state "$backup" || { yellow "原配置恢复失败，请检查文件与权限。"; return 1; }
     yellow "新配置校验失败，已恢复原配置。"
     return 1
   fi
   install -m640 -o root -g "$SERVICE_GROUP" "$candidate" "$CONFIG_FILE"
   rm -rf -- "$candidate_dir"
-  chown root:"$SERVICE_GROUP" "$APP_DIR"
-  chmod 750 "$APP_DIR"
   if ! make_service; then
-    restore_state "$backup"
+    restore_state "$backup" || { yellow "原配置恢复失败，请检查文件与权限。"; return 1; }
     if [[ -r "$ENV_FILE" || -r "$SS_ENV_FILE" ]]; then
       service_restart || yellow "原配置也未能启动，请检查上述日志。"
     else
@@ -870,7 +888,11 @@ ensure_min_client_version() {
     yellow "无法写入 REALITY 最低客户端版本，原配置未修改。"
     return 1
   fi
-  install -m640 -o root -g "$SERVICE_GROUP" "$candidate" "$CONFIG_FILE"
+  if ! install -m640 -o root -g "$SERVICE_GROUP" "$candidate" "$CONFIG_FILE" ||
+     ! restore_config_permissions; then
+    rm -rf -- "$candidate_dir"
+    return 1
+  fi
   rm -rf -- "$candidate_dir"
 }
 
