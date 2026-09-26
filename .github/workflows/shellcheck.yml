@@ -8,6 +8,20 @@ permissions:
   contents: read
 
 jobs:
+  independent-socks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and verify pinned independent SOCKS5
+        run: |
+          curl -fL --retry 3 https://github.com/heiher/hev-socks5-server/releases/download/2.13.1/hev-socks5-server-linux-x86_64 -o "$RUNNER_TEMP/hev-socks"
+          printf '9707a6d9e6419f6474173affa9d00b25a9ec61c9f320f2d19bb14a0a5a584bc5  %s\n' "$RUNNER_TEMP/hev-socks" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/hev-socks"
+      - name: Fixed-port authenticated TCP/UDP and concurrent NAT relay tests
+        run: python3 tests/independent_socks.py "$RUNNER_TEMP/hev-socks"
+      - name: Alpine musl runtime test
+        run: |
+          docker run --rm -v "$PWD:/work:ro" -v "$RUNNER_TEMP/hev-socks:/hev-socks:ro" -w /work alpine:3.23 sh -c 'apk add --no-cache bash python3 openssl && python3 tests/independent_socks.py /hev-socks'
   shellcheck:
     runs-on: ubuntu-latest
     steps:
