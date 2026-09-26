@@ -13,7 +13,12 @@ systemctl() { :; }
 chown() { :; }
 chmod() { :; }
 install() {
-  if [[ "$1" == -d ]]; then mkdir -p "${!#}"; else /usr/bin/install "$@"; fi
+  if [[ "$1" == -d ]]; then
+    mkdir -p "${!#}"
+  else
+    # Permission/ownership is covered separately by root integration tests.
+    cp -- "${@: -2:1}" "${@: -1}"
+  fi
 }
 socks_stop() { :; }
 socks_restart() { :; }
