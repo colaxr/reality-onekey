@@ -451,10 +451,14 @@ verify_service() {
 }
 
 service_status() {
-  if [[ "$INIT" == "systemd" ]]; then
-    systemctl --no-pager --full status "$APP_NAME" || true
+  if has_xray_nodes; then
+    if [[ "$INIT" == "systemd" ]]; then
+      systemctl --no-pager --full status "$APP_NAME" || true
+    else
+      rc-service "$APP_NAME" status || true
+    fi
   else
-    rc-service "$APP_NAME" status || true
+    info "未安装 REALITY/SS 或旧共用 SOCKS5，主 Xray 服务不需要运行。"
   fi
   if socks_is_independent; then
     if [[ "$INIT" == systemd ]]; then
@@ -1315,6 +1319,9 @@ update_xray() {
   [[ -x "$XRAY_BIN" && -r "$CONFIG_FILE" ]] ||
     { yellow "请先安装 REALITY/SS；独立 SOCKS5 固定版本不使用菜单 5 更新。"; return 1; }
   current="v$("$XRAY_BIN" version | awk 'NR == 1 {print $2}')"
+  if socks_is_independent; then
+    info "此菜单只更新 REALITY/SS 主内核；独立 SOCKS5 固定 ${SOCKS_VERSION}，不会重启或升级。"
+  fi
   releases="$(curl -fsSL --max-time 15 \
     "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=10" 2>/dev/null || true)"
   while IFS= read -r target; do
