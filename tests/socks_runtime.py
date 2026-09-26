@@ -123,7 +123,8 @@ rebuild_config
                     with conn:
                         assert status == 0
                         relay = request(conn, 3, udp.getsockname()[1])
-                        assert relay == ("127.0.0.1", ports[2]), relay
+                        assert relay[0] == "127.0.0.1" and relay[1] > 0, relay
+                        print("SOCKS UDP relay mode:", "fixed" if relay[1] == ports[2] else "dynamic")
                         packet = b"\x00\x00\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack("!H", echo.getsockname()[1]) + b"SOCKS UDP test"
                         # The server installs its UDP authorization after writing
                         # the association response; retries cover that small race.

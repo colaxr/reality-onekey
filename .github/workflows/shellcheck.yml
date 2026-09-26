@@ -28,6 +28,7 @@ jobs:
   socks-runtime:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         version: [v26.3.27, v26.7.28, v26.9.9]
     steps:

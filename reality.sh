@@ -925,6 +925,7 @@ configure_socks() {
     current_server="$(public_ip)"
   fi
   info "SOCKS5 启用用户名/密码认证及 TCP + UDP；协议本身不加密。"
+  yellow "v26.7.28/v26.9.9 需要动态 UDP 端口和本机 IPv4；单端口 NAT 请使用固定 UDP 端口的 v26.3.27。"
   server_ip="$(prompt "服务器公网 IP/域名" "$current_server")"
   validate_server_address "$server_ip" || { yellow "服务器地址格式不正确。"; return 1; }
   port="$(prompt "监听端口" "$current_port")"
@@ -947,7 +948,7 @@ configure_socks() {
   backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
   backup_state "$backup" || { rm -rf -- "$backup"; return 1; }
   write_socks_env "$server_ip" "$port" "$username" "$password" "$node_name" "$udp_ip"
-  if apply_node_change "$backup" "SOCKS5 配置完成。请放行 TCP/UDP ${port}；NAT 两种协议需使用与监听端口相同的公网端口。"; then
+  if apply_node_change "$backup" "SOCKS5 配置完成。请放行 TCP/UDP ${port}，并根据 Xray 版本放行协商的 UDP 转发端口。"; then
     rm -rf -- "$backup"
     show_socks
   else
@@ -963,6 +964,7 @@ show_socks() {
   printf '\nSOCKS5 节点信息\n名称：%s\n服务器：%s\n端口：%s\n用户名：%s\n密码：%s\nUDP 转发 IPv4：%s\n网络：TCP + UDP\n' \
     "$SOCKS_NODE_NAME" "$SOCKS_SERVER_IP" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASSWORD" "$SOCKS_UDP_IP"
   info "客户端需支持 SOCKS5 UDP ASSOCIATE；如不识别链接，请按上述字段手动添加。"
+  yellow "v26.7.28/v26.9.9 使用动态 UDP 端口，需允许这些端口入站；仅映射单端口的 NAT 不适用。v26.3.27 使用同号固定 UDP 端口。"
   green "socks5://$(urlencode "$SOCKS_USER"):$(urlencode "$SOCKS_PASSWORD")@${host}:${SOCKS_PORT}#$(urlencode "$SOCKS_NODE_NAME")"
 }
 
@@ -1074,6 +1076,9 @@ update_xray() {
   if [[ "$target" == "$current" ]]; then
     read -r -p "目标版本与当前版本相同，仍要重新安装吗？[y/N]: " choice
     [[ "$choice" =~ ^[Yy]$ ]] || return 0
+  fi
+  if [[ -r "$SOCKS_ENV_FILE" ]]; then
+    yellow "SOCKS5 提醒：v26.7.28/v26.9.9 使用动态 UDP 端口，单端口 NAT 或未放行动态端口时 UDP 不可用。"
   fi
 
   backup="$(mktemp -d /var/tmp/reality-backup.XXXXXX)" || return 1

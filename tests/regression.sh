@@ -143,6 +143,8 @@ install() {
   local target="${!#}"
   if [[ "$1" == -d ]]; then mkdir -p "$target"; else /usr/bin/install "$@"; fi
 }
+# Defined immediately above; later redefinition confuses older ShellCheck.
+# shellcheck disable=SC2218
 install -d -m700 "$APP_DIR"
 cat >"$CONFIG_FILE" <<'EOF'
 {"inbounds":[{"protocol":"vless","streamSettings":{"realitySettings":{"privateKey":"CNbUQuA6-wuMRF2DIaS6R3CUJBa7CGO0wLE8Aj0HoH0"}}}]}
