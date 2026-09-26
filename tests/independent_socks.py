@@ -83,7 +83,9 @@ rebuild_config
                         conn, status = authenticate(port)
                         stack.enter_context(conn)
                         assert status == 0
-                        relay = request(conn, 3, udp.getsockname()[1])
+                        # NAT clients often cannot predict the translated UDP
+                        # source port and request an initially unknown port (0).
+                        relay = request(conn, 3, udp.getsockname()[1] if public_ip == "127.0.0.1" else 0)
                         assert relay == (public_ip, port), relay
                         clients.append(udp)
                     for turn in range(10):
