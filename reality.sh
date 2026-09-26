@@ -13,6 +13,13 @@ readonly CONFIG_FILE="${APP_DIR}/config.json"
 readonly ENV_FILE="${APP_DIR}/node.env"
 readonly SS_ENV_FILE="${APP_DIR}/ss.env"
 readonly SOCKS_ENV_FILE="${APP_DIR}/socks.env"
+readonly SOCKS_NAME="reality-onekey-socks"
+readonly SOCKS_DIR="${ROOT_PREFIX}/etc/${SOCKS_NAME}"
+readonly SOCKS_CONFIG="${SOCKS_DIR}/config.json"
+readonly SOCKS_BIN="${ROOT_PREFIX}/usr/local/bin/xray-socks5"
+readonly SOCKS_SYSTEMD="${ROOT_PREFIX}/etc/systemd/system/${SOCKS_NAME}.service"
+readonly SOCKS_OPENRC="${ROOT_PREFIX}/etc/init.d/${SOCKS_NAME}"
+readonly SOCKS_VERSION="v26.3.27"
 readonly SYSTEMD_FILE="${ROOT_PREFIX}/etc/systemd/system/${APP_NAME}.service"
 readonly OPENRC_FILE="${ROOT_PREFIX}/etc/init.d/${APP_NAME}"
 readonly RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
@@ -368,7 +375,7 @@ managed_listeners() {
     validate_port "${SS_PORT:-}" || return 1
     printf 'tcp %s\nudp %s\n' "$SS_PORT" "$SS_PORT"
   fi
-  if [[ -r "$SOCKS_ENV_FILE" ]]; then
+  if [[ -r "$SOCKS_ENV_FILE" ]] && ! socks_is_independent; then
     # shellcheck disable=SC1090
     . "$SOCKS_ENV_FILE"
     validate_port "${SOCKS_PORT:-}" || return 1
@@ -449,14 +456,26 @@ service_status() {
   else
     rc-service "$APP_NAME" status || true
   fi
+  if socks_is_independent; then
+    if [[ "$INIT" == systemd ]]; then
+      systemctl --no-pager --full status "$SOCKS_NAME" || true
+    else
+      rc-service "$SOCKS_NAME" status || true
+    fi
+  fi
 }
 
 remove_node_files() {
   service_stop
   rm -f -- "$SYSTEMD_FILE" "$OPENRC_FILE"
-  rm -rf -- "$APP_DIR"
+  if socks_is_independent; then
+    rm -f -- "$ENV_FILE" "$SS_ENV_FILE" "$CONFIG_FILE"
+  else
+    rm -rf -- "$APP_DIR"
+  fi
   rm -f -- "/var/log/${APP_NAME}.log" "/var/log/${APP_NAME}.err" "/run/${APP_NAME}.pid"
-  [[ "$INIT" == "systemd" ]] && systemctl daemon-reload
+  if [[ "$INIT" == "systemd" ]]; then systemctl daemon-reload || return 1; fi
+  return 0
 }
 
 load_reality() {
@@ -504,8 +523,10 @@ load_socks() {
     [[ "${1:-}" == quiet ]] || yellow "尚未安装 SOCKS5 节点。"
     return 1
   fi
+  SOCKS_BACKEND=xray
   # shellcheck disable=SC1090
   . "$SOCKS_ENV_FILE"
+  [[ "$SOCKS_BACKEND" == xray || "$SOCKS_BACKEND" == xray-fixed ]] || return 1
   SOCKS_USER="$(base64_decode "$SOCKS_USER_B64" 2>/dev/null)" || return 1
   SOCKS_PASSWORD="$(base64_decode "$SOCKS_PASSWORD_B64" 2>/dev/null)" || return 1
   validate_socks_credential "$SOCKS_USER" && validate_socks_credential "$SOCKS_PASSWORD" &&
@@ -513,7 +534,7 @@ load_socks() {
 }
 
 write_socks_env() {
-  install -d -m700 "$APP_DIR"
+  [[ -d "$APP_DIR" ]] || install -d -m700 "$APP_DIR" || return 1
   cat >"$SOCKS_ENV_FILE" <<EOF
 SOCKS_SERVER_IP='$1'
 SOCKS_PORT='$2'
@@ -521,6 +542,7 @@ SOCKS_USER_B64='$(base64_encode "$3")'
 SOCKS_PASSWORD_B64='$(base64_encode "$4")'
 SOCKS_NODE_NAME='$5'
 SOCKS_UDP_IP='$6'
+SOCKS_BACKEND='${7:-xray}'
 EOF
   chmod 600 "$SOCKS_ENV_FILE"
 }
@@ -563,7 +585,7 @@ EOF
 # shellcheck disable=SC2153
 rebuild_config() {
   local output="${1:-$CONFIG_FILE}" comma="" private_key ss_password
-  [[ -r "$ENV_FILE" || -r "$SS_ENV_FILE" || -r "$SOCKS_ENV_FILE" ]] || return 1
+  has_xray_nodes || return 1
   # Rendering a candidate must not change permissions of the live directory.
   [[ -d "$APP_DIR" ]] || install -d -m700 "$APP_DIR" || return 1
   {
@@ -625,7 +647,7 @@ EOF
 EOF
       comma=,
     fi
-    if [[ -r "$SOCKS_ENV_FILE" ]]; then
+    if [[ -r "$SOCKS_ENV_FILE" ]] && ! socks_is_independent; then
       load_socks quiet || { yellow "SOCKS5 参数损坏，配置未应用。" >&2; return 1; }
       printf '%s\n' "$comma"
       # accounts is supported by both older and newer Xray releases.
@@ -656,12 +678,16 @@ EOF
   chmod 600 "$output"
 }
 
-install_common() {
+install_manager() {
   install_dependencies || die "依赖未就绪。"
   if [[ "$(readlink -f "$0" 2>/dev/null || true)" != "$MANAGER_BIN" ]]; then
     install -Dm755 "$0" "$MANAGER_BIN"
   fi
   ln -sf "$MANAGER_BIN" "$SHORTCUT_BIN"
+}
+
+install_common() {
+  install_manager
   if [[ -x "$XRAY_BIN" ]] && "$XRAY_BIN" version >/dev/null 2>&1; then
     info "复用已安装的 Xray；如需升级或重装，请使用菜单 5。"
   else
@@ -688,8 +714,9 @@ ports_conflict() {
 
 backup_state() {
   local target="$1"
-  mkdir -p "$target"
-  [[ -d "$APP_DIR" ]] && cp -a "$APP_DIR/." "$target/"
+  mkdir -p "$target" || return 1
+  if [[ -d "$APP_DIR" ]]; then cp -a "$APP_DIR/." "$target/" || return 1; fi
+  return 0
 }
 
 restore_state() {
@@ -719,7 +746,7 @@ apply_node_change() {
   rm -rf -- "$candidate_dir"
   if ! make_service; then
     restore_state "$backup" || { yellow "原配置恢复失败，请检查文件与权限。"; return 1; }
-    if [[ -r "$ENV_FILE" || -r "$SS_ENV_FILE" || -r "$SOCKS_ENV_FILE" ]]; then
+    if has_xray_nodes; then
       service_restart || yellow "原配置也未能启动，请检查上述日志。"
     else
       remove_node_files
@@ -912,6 +939,229 @@ edit_ss() {
   fi
 }
 
+socks_is_independent() {
+  [[ -r "$SOCKS_ENV_FILE" ]] && grep -qx "SOCKS_BACKEND='xray-fixed'" "$SOCKS_ENV_FILE"
+}
+
+has_xray_nodes() {
+  [[ -r "$ENV_FILE" || -r "$SS_ENV_FILE" ]] ||
+    { [[ -r "$SOCKS_ENV_FILE" ]] && ! socks_is_independent; }
+}
+
+download_socks() {
+  local digest temp actual version staged
+  case "$ARCH" in
+    64) digest=23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae ;;
+    arm64-v8a) digest=4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c ;;
+    *) yellow "不支持的 SOCKS5 架构。"; return 1 ;;
+  esac
+  if [[ -x "$SOCKS_BIN" ]]; then
+    version="$("$SOCKS_BIN" version | awk 'NR == 1 {print "v"$2}')" || return 1
+    if [[ "$version" == "$SOCKS_VERSION" ]]; then
+      setcap cap_net_bind_service=+ep "$SOCKS_BIN" || return 1
+      info "复用独立 SOCKS5 Xray ${SOCKS_VERSION}。"
+      return 0
+    fi
+    yellow "独立 SOCKS5 内核版本不符，未覆盖正在使用的文件，请先排查。"
+    return 1
+  fi
+  temp="$(mktemp -d /var/tmp/reality-socks-download.XXXXXX)" || return 1
+  info "下载独立 SOCKS5 Xray ${SOCKS_VERSION}（${ARCH}）..."
+  if ! curl -fL --retry 3 -o "$temp/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/${SOCKS_VERSION}/Xray-linux-${ARCH}.zip"; then
+    rm -rf -- "$temp"; return 1
+  fi
+  actual="$(openssl dgst -sha256 "$temp/xray.zip")" || { rm -rf -- "$temp"; return 1; }
+  if [[ "${actual##* }" != "$digest" ]]; then
+    rm -rf -- "$temp"; yellow "SOCKS5 Xray SHA256 校验失败，未安装。"; return 1
+  fi
+  if ! unzip -oq "$temp/xray.zip" xray -d "$temp"; then rm -rf -- "$temp"; return 1; fi
+  chmod 755 "$temp/xray"
+  version="$("$temp/xray" version | awk 'NR == 1 {print "v"$2}')" || { rm -rf -- "$temp"; return 1; }
+  if [[ "$version" != "$SOCKS_VERSION" ]]; then rm -rf -- "$temp"; return 1; fi
+  staged="${SOCKS_BIN}.new.$$"
+  if ! install -Dm755 "$temp/xray" "$staged" || ! setcap cap_net_bind_service=+ep "$staged" ||
+     ! mv -f -- "$staged" "$SOCKS_BIN"; then
+    rm -f -- "$staged"; rm -rf -- "$temp"; return 1
+  fi
+  rm -rf -- "$temp"
+}
+
+render_socks_config() {
+  load_socks quiet || return 1
+  cat <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [{
+    "tag": "socks-in",
+    "listen": "0.0.0.0",
+    "port": ${SOCKS_PORT},
+    "protocol": "socks",
+    "settings": {
+      "auth": "password",
+      "accounts": [{ "user": "$(json_escape "$SOCKS_USER")", "pass": "$(json_escape "$SOCKS_PASSWORD")" }],
+      "udp": true,
+      "ip": "${SOCKS_UDP_IP}"
+    }
+  }],
+  "outbounds": [{ "protocol": "freedom", "tag": "direct" }]
+}
+EOF
+}
+
+validate_socks_config() {
+  "$SOCKS_BIN" run -test -c "$1"
+}
+
+socks_stop() {
+  if [[ "$INIT" == systemd ]]; then
+    systemctl stop "$SOCKS_NAME" 2>/dev/null || true
+  else
+    rc-service "$SOCKS_NAME" stop 2>/dev/null || true
+  fi
+}
+
+remove_socks_service() {
+  socks_stop
+  if [[ "$INIT" == systemd ]]; then
+    systemctl disable "$SOCKS_NAME" 2>/dev/null || true
+  else
+    rc-update del "$SOCKS_NAME" default 2>/dev/null || true
+  fi
+  rm -f -- "$SOCKS_SYSTEMD" "$SOCKS_OPENRC" "$SOCKS_BIN"
+  rm -rf -- "$SOCKS_DIR"
+  rm -f -- "/run/${SOCKS_NAME}.pid" "/var/log/${SOCKS_NAME}.log" "/var/log/${SOCKS_NAME}.err"
+  if [[ "$INIT" == systemd ]]; then systemctl daemon-reload; fi
+}
+
+socks_permissions() {
+  chown root:"$SERVICE_GROUP" "$APP_DIR" "$SOCKS_DIR" "$SOCKS_CONFIG" || return 1
+  chmod 750 "$APP_DIR" "$SOCKS_DIR" && chmod 640 "$SOCKS_CONFIG" || return 1
+  chown root:root "$SOCKS_ENV_FILE" && chmod 600 "$SOCKS_ENV_FILE" || return 1
+  [[ ! -f "$CONFIG_FILE" ]] || restore_config_permissions || return 1
+}
+
+socks_restart() {
+  local pid previous="" stable=0 attempt
+  socks_permissions || return 1
+  if [[ "$INIT" == systemd ]]; then
+    systemctl restart "$SOCKS_NAME" || return 1
+  else
+    rc-service "$SOCKS_NAME" restart || return 1
+  fi
+  load_socks quiet || return 1
+  # The pinned SOCKS kernel listens on a fixed TCP and UDP port at startup.
+  info "检查独立 SOCKS5 进程及固定 TCP/UDP ${SOCKS_PORT}。"
+  for attempt in {1..10}; do
+    sleep 1
+    if [[ "$INIT" == systemd ]]; then
+      pid="$(systemctl show "$SOCKS_NAME" -p MainPID --value 2>/dev/null)"
+      [[ "$(systemctl show "$SOCKS_NAME" -p ActiveState --value 2>/dev/null)" == active ]] || pid=0
+    else
+      pid="$(cat "/run/${SOCKS_NAME}.pid" 2>/dev/null || true)"
+    fi
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null && service_listening "$pid" "$SOCKS_PORT" && service_udp_listening "$pid" "$SOCKS_PORT"; then
+      if [[ "$pid" == "$previous" ]]; then stable=$((stable + 1)); else stable=1; fi
+      previous="$pid"
+      (( stable < 3 )) || return 0
+    else
+      stable=0; previous=""
+    fi
+  done
+  yellow "独立 SOCKS5 未通过启动检查。"
+  if [[ "$INIT" == systemd ]]; then
+    journalctl -u "$SOCKS_NAME" -n 20 --no-pager || true
+  else
+    tail -n 20 "/var/log/${SOCKS_NAME}.err" || true
+  fi
+  return 1
+}
+
+make_socks_service() {
+  if [[ "$INIT" == systemd ]]; then
+    cat >"$SOCKS_SYSTEMD" <<EOF
+[Unit]
+Description=Independent SOCKS5 TCP/UDP Service
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=nobody
+Group=${SERVICE_GROUP}
+ExecStart=${SOCKS_BIN} run -c ${SOCKS_CONFIG}
+Restart=on-failure
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload && systemctl enable "$SOCKS_NAME" || return 1
+  else
+    touch "/var/log/${SOCKS_NAME}.log" "/var/log/${SOCKS_NAME}.err"
+    chown nobody:"$SERVICE_GROUP" "/var/log/${SOCKS_NAME}.log" "/var/log/${SOCKS_NAME}.err" || return 1
+    cat >"$SOCKS_OPENRC" <<EOF
+#!/sbin/openrc-run
+name="Independent SOCKS5 TCP/UDP Service"
+command="${SOCKS_BIN}"
+command_args="run -c ${SOCKS_CONFIG}"
+command_user="nobody"
+command_background="yes"
+pidfile="/run/${SOCKS_NAME}.pid"
+output_log="/var/log/${SOCKS_NAME}.log"
+error_log="/var/log/${SOCKS_NAME}.err"
+depend() { need net; }
+EOF
+    chmod 755 "$SOCKS_OPENRC"
+    rc-update add "$SOCKS_NAME" default || return 1
+  fi
+  socks_restart
+}
+
+apply_socks_change() {
+  local backup="$1" ok=true migrated=false candidate_dir
+  candidate_dir="$(mktemp -d /var/tmp/reality-socks-config.XXXXXX)" || {
+    restore_state "$backup"; return 1
+  }
+  if ! render_socks_config >"$candidate_dir/config.json" || ! validate_socks_config "$candidate_dir/config.json"; then
+    rm -rf -- "$candidate_dir"
+    restore_state "$backup" || return 1
+    yellow "SOCKS5 新配置校验失败，原服务未重启。"
+    return 1
+  fi
+  # Only migration of an old shared inbound restarts the main Xray.
+  if [[ -r "$backup/socks.env" ]] && ! grep -qx "SOCKS_BACKEND='xray-fixed'" "$backup/socks.env"; then
+    migrated=true
+    if has_xray_nodes; then
+      apply_node_change "$backup" "REALITY/SS 配置已保留，已移除旧共用 SOCKS5 入站。" || ok=false
+    else
+      remove_node_files
+    fi
+  fi
+  if [[ "$ok" == true ]]; then
+    install -d -m750 "$SOCKS_DIR" || ok=false
+    install -m640 "$candidate_dir/config.json" "$SOCKS_CONFIG" || ok=false
+    if [[ "$ok" == true ]] && make_socks_service; then
+      rm -rf -- "$candidate_dir"
+      return 0
+    fi
+  fi
+  rm -rf -- "$candidate_dir"
+  socks_stop
+  restore_state "$backup" || { yellow "配置恢复失败，请检查权限。"; return 1; }
+  if socks_is_independent && [[ -f "$backup.json" ]]; then
+    install -m640 "$backup.json" "$SOCKS_CONFIG"
+    socks_restart || yellow "原 SOCKS5 未能恢复，请查看服务日志。"
+  else
+    remove_socks_service
+  fi
+  if [[ "$migrated" == true ]] && has_xray_nodes; then
+    make_service || yellow "原 Xray 未能恢复，请查看服务日志。"
+  fi
+  yellow "独立 SOCKS5 应用失败，已恢复原节点配置。"
+  return 1
+}
+
 configure_socks() {
   local action="${1:-install}" server_ip port username password node_name udp_ip udp_default backup
   local current_server="" current_port=1080 current_user=socks current_password="" current_name="" current_udp=""
@@ -921,11 +1171,12 @@ configure_socks() {
     current_user="$SOCKS_USER"; current_password="$SOCKS_PASSWORD"
     current_name="$SOCKS_NODE_NAME"; current_udp="$SOCKS_UDP_IP"
   else
-    install_common
     current_server="$(public_ip)"
   fi
+  install_manager
   info "SOCKS5 启用用户名/密码认证及 TCP + UDP；协议本身不加密。"
-  yellow "v26.7.28/v26.9.9 需要动态 UDP 端口和本机 IPv4；单端口 NAT 请使用固定 UDP 端口的 v26.3.27。"
+  info "独立 SOCKS5 服务：TCP 与客户端 UDP 转发使用同一固定端口，不依赖 Xray 版本。"
+  yellow "NAT 必须同时映射 TCP/UDP，且公网与本机端口相同；客户端须支持 UDP ASSOCIATE。"
   server_ip="$(prompt "服务器公网 IP/域名" "$current_server")"
   validate_server_address "$server_ip" || { yellow "服务器地址格式不正确。"; return 1; }
   port="$(prompt "监听端口" "$current_port")"
@@ -947,12 +1198,22 @@ configure_socks() {
   validate_node_name "$node_name" || { yellow "节点名称格式不正确。"; return 1; }
   backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
   backup_state "$backup" || { rm -rf -- "$backup"; return 1; }
-  write_socks_env "$server_ip" "$port" "$username" "$password" "$node_name" "$udp_ip"
-  if apply_node_change "$backup" "SOCKS5 配置完成。请放行 TCP/UDP ${port}，并根据 Xray 版本放行协商的 UDP 转发端口。"; then
+  if ! download_socks; then rm -rf -- "$backup"; return 1; fi
+  if [[ -f "$SOCKS_CONFIG" ]] && ! cp -a "$SOCKS_CONFIG" "$backup.json"; then
+    rm -rf -- "$backup"; return 1
+  fi
+  if ! write_socks_env "$server_ip" "$port" "$username" "$password" "$node_name" "$udp_ip" xray-fixed; then
+    restore_state "$backup"
+    rm -rf -- "$backup"; rm -f -- "$backup.json"; return 1
+  fi
+  if apply_socks_change "$backup"; then
     rm -rf -- "$backup"
+    rm -f -- "$backup.json"
+    green "SOCKS5 配置完成。请放行/映射 TCP 和 UDP ${port}；Xray 升降级不会改变 SOCKS5。"
     show_socks
   else
     rm -rf -- "$backup"
+    rm -f -- "$backup.json"
     return 1
   fi
 }
@@ -964,7 +1225,11 @@ show_socks() {
   printf '\nSOCKS5 节点信息\n名称：%s\n服务器：%s\n端口：%s\n用户名：%s\n密码：%s\nUDP 转发 IPv4：%s\n网络：TCP + UDP\n' \
     "$SOCKS_NODE_NAME" "$SOCKS_SERVER_IP" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASSWORD" "$SOCKS_UDP_IP"
   info "客户端需支持 SOCKS5 UDP ASSOCIATE；如不识别链接，请按上述字段手动添加。"
-  yellow "v26.7.28/v26.9.9 使用动态 UDP 端口，需允许这些端口入站；仅映射单端口的 NAT 不适用。v26.3.27 使用同号固定 UDP 端口。"
+  if socks_is_independent; then
+    info "独立 Xray ${SOCKS_VERSION}；固定 TCP/UDP ${SOCKS_PORT}，与 REALITY/SS 内核分开管理。"
+  else
+    yellow "旧版 Xray SOCKS5：新 Xray 可能使用动态 UDP 端口。菜单 2 → SOCKS5 可保留参数迁移至独立服务。"
+  fi
   green "socks5://$(urlencode "$SOCKS_USER"):$(urlencode "$SOCKS_PASSWORD")@${host}:${SOCKS_PORT}#$(urlencode "$SOCKS_NODE_NAME")"
 }
 
@@ -981,13 +1246,19 @@ delete_protocol() {
     read -r -p "将删除 ${label} 节点，其他协议节点会保留，确定吗？[y/N]: " answer
     [[ "$answer" =~ ^[Yy]$ ]] || { yellow "已取消。"; return 0; }
   fi
+  if [[ "$protocol" == socks ]] && socks_is_independent; then
+    remove_socks_service
+    rm -f -- "$SOCKS_ENV_FILE"
+    green "已删除独立 SOCKS5 节点；REALITY/SS 不受影响。"
+    return 0
+  fi
   backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
   backup_state "$backup"
   rm -f -- "$file"
-  if [[ ! -r "$ENV_FILE" && ! -r "$SS_ENV_FILE" && ! -r "$SOCKS_ENV_FILE" ]]; then
+  if ! has_xray_nodes; then
     remove_node_files
     rm -rf -- "$backup"
-    green "已删除 ${label} 节点；当前没有其他节点，服务已移除，Xray 和管理命令仍保留。"
+    green "已删除 ${label} 节点及 Xray 节点服务；独立 SOCKS5（如有）继续运行，Xray 和管理命令仍保留。"
     return 0
   fi
   if apply_node_change "$backup" "已删除 ${label} 节点，其他节点继续运行。"; then
@@ -1004,6 +1275,8 @@ uninstall_reality() {
     read -r -p "将完全删除 Xray、REALITY/SS/SOCKS5 配置、服务和日志，确定吗？[y/N]: " answer
     [[ "$answer" =~ ^[Yy]$ ]] || { yellow "已取消。"; return; }
   fi
+  remove_socks_service
+  rm -f -- "$SOCKS_ENV_FILE"
   remove_node_files
   rm -f -- "$XRAY_BIN" "$SHORTCUT_BIN" "$MANAGER_BIN"
   rm -rf -- "$XRAY_DIR"
@@ -1034,7 +1307,7 @@ update_xray() {
   local current releases choice target index backup
   local -a versions=()
   [[ -x "$XRAY_BIN" && -r "$CONFIG_FILE" ]] ||
-    { yellow "请先安装节点。"; return 1; }
+    { yellow "请先安装 REALITY/SS；独立 SOCKS5 固定版本不使用菜单 5 更新。"; return 1; }
   current="v$("$XRAY_BIN" version | awk 'NR == 1 {print $2}')"
   releases="$(curl -fsSL --max-time 15 \
     "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=10" 2>/dev/null || true)"
@@ -1077,7 +1350,7 @@ update_xray() {
     read -r -p "目标版本与当前版本相同，仍要重新安装吗？[y/N]: " choice
     [[ "$choice" =~ ^[Yy]$ ]] || return 0
   fi
-  if [[ -r "$SOCKS_ENV_FILE" ]]; then
+  if [[ -r "$SOCKS_ENV_FILE" ]] && ! socks_is_independent; then
     yellow "SOCKS5 提醒：v26.7.28/v26.9.9 使用动态 UDP 端口，单端口 NAT 或未放行动态端口时 UDP 不可用。"
   fi
 

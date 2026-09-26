@@ -8,19 +8,38 @@ permissions:
   contents: read
 
 jobs:
+  independent-socks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download isolated kernels and verify pinned SOCKS5 archive
+        run: |
+          mkdir -p "$RUNNER_TEMP/socks-fixed" "$RUNNER_TEMP/main-xray"
+          curl -fL --retry 3 https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip -o "$RUNNER_TEMP/socks.zip"
+          printf '23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae  %s\n' "$RUNNER_TEMP/socks.zip" | sha256sum -c -
+          unzip -oq "$RUNNER_TEMP/socks.zip" xray -d "$RUNNER_TEMP/socks-fixed"
+          curl -fL --retry 3 https://github.com/XTLS/Xray-core/releases/download/v26.9.9/Xray-linux-64.zip -o "$RUNNER_TEMP/main.zip"
+          unzip -oq "$RUNNER_TEMP/main.zip" xray -d "$RUNNER_TEMP/main-xray"
+          chmod +x "$RUNNER_TEMP/socks-fixed/xray" "$RUNNER_TEMP/main-xray/xray"
+      - name: Fixed-port auth, concurrent UDP and separate main-kernel restart
+        run: python3 tests/independent_socks.py "$RUNNER_TEMP/socks-fixed/xray" "$RUNNER_TEMP/main-xray/xray"
+      - name: Alpine musl runtime test
+        run: |
+          docker run --rm -v "$PWD:/work:ro" -v "$RUNNER_TEMP/socks-fixed/xray:/fixed-xray:ro" -v "$RUNNER_TEMP/main-xray/xray:/main-xray:ro" -w /work alpine:3.23 sh -c 'apk add --no-cache bash python3 openssl && python3 tests/independent_socks.py /fixed-xray /main-xray'
   shellcheck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Bash syntax and regression checks
         run: |
-          bash -n reality.sh install.sh tests/regression.sh tests/permissions.sh
+          bash -n reality.sh install.sh tests/regression.sh tests/permissions.sh tests/independent_lifecycle.sh
           bash tests/regression.sh
+          bash tests/independent_lifecycle.sh
       - name: Real service-user permission checks
         run: sudo bash tests/permissions.sh
       - name: Run ShellCheck
         run: |
-          shellcheck --format=gcc reality.sh install.sh tests/regression.sh tests/permissions.sh > /tmp/shellcheck.txt || result=$?
+          shellcheck --format=gcc reality.sh install.sh tests/regression.sh tests/permissions.sh tests/independent_lifecycle.sh > /tmp/shellcheck.txt || result=$?
           while IFS= read -r line; do
             printf '::error::%s\n' "$line"
           done < /tmp/shellcheck.txt

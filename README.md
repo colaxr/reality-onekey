@@ -10,7 +10,7 @@ AMD64（x86_64）和 ARM64（aarch64），包含安装、自定义配置、节�
 
 下载解压及内核更新备份使用 `/var/tmp`，避免常见的 `/tmp` 内存盘占用；若 `/var/tmp` 本身也挂载在内存盘，仍会消耗内存，需要保证该位置有足够空间。
 
-安装、修改及更新后会检查服务 PID 和全部节点监听，REALITY 检查 TCP，Shadowsocks 和 SOCKS5 同时检查 TCP 和 UDP，要求连续三次通过才报告成功。OpenRC 后台进程立即退出会被检测到；修改配置或更新失败会尝试回滚。此检查不代表公网连通性测试。Xray 升级/重装仍使用菜单 5。
+安装、修改及更新后会检查服务 PID 和节点监听，REALITY 检查 TCP，Shadowsocks 和独立 SOCKS5 检查 TCP 和 UDP，要求连续三次通过才报告成功。OpenRC 后台进程立即退出会被检测到；修改配置或更新失败会尝试回滚。此检查不代表公网连通性测试。菜单 5 只更新 REALITY/SS 使用的 Xray，不升级独立 SOCKS5 的固定版本。
 
 通常会通过 `/proc/<PID>/fd` 严格确认监听 socket 属于 Xray 进程。若受限容器拒绝读取 fd 链接，则改为连续检查 systemd/OpenRC 管理的同一 PID 存活和所需 TCP/UDP 端口监听，并在成功时提示使用了备用检查；fd 可正常读取的普通 VPS 仍使用严格核验。
 
@@ -20,7 +20,7 @@ AMD64（x86_64）和 ARM64（aarch64），包含安装、自定义配置、节�
 | Ubuntu 20.04+ | systemd | ✅ | ✅ |
 | Alpine 3.18+ | OpenRC | ✅ | ✅ |
 
-脚本支持 VLESS + TCP + REALITY + `xtls-rprx-vision`，以及原生 TCP + UDP 的 Shadowsocks 和带用户名/密码认证的 SOCKS5。三种节点可以单独安装，也可以共用一个 Xray 服务同时运行，但必须使用不同端口。Xray 二进制取自
+脚本支持 VLESS + TCP + REALITY + `xtls-rprx-vision`，以及原生 TCP + UDP 的 Shadowsocks 和带用户名/密码认证的 SOCKS5。三种节点可以单独安装或同时运行，但必须使用不同端口。REALITY/SS 共用主 Xray；SOCKS5 使用另一份独立的固定版本 Xray。只安装其中一类时只运行一个进程；两类都安装才运行两个。Xray 二进制取自
 [XTLS/Xray-core](https://github.com/XTLS/Xray-core) 官方 Release。
 
 ## 快速使用
@@ -95,11 +95,16 @@ Base64 只是存储编码，不是加密。查询提供完整字段及 `socks5:/
 
 此实现监听 IPv4 的 TCP 和 UDP，需同时放行所选端口。客户端必须支持 SOCKS5
 `UDP ASSOCIATE`，仅能连接 TCP 不代表能转发 UDP。UDP 转发 IPv4 必须是客户端可达
-的地址。Xray v26.3.27 使用同号固定 UDP 端口；该版本的 NAT 机器填写公网 IPv4，
-并将同号公网 TCP/UDP 端口映射至所选监听端口。v26.7.28/v26.9.9 则为每次关联
-分配动态 UDP 端口，客户端必须使用协商返回的端口，防火墙也需放行动态端口。
-这些新版还会绑定填写的 UDP IP，因此该地址应属于本机；仅映射单端口的 NAT
-机器不能按此方式使用新版 UDP，应选择支持固定端口的版本或使用现有 SS/REALITY。
+的地址。SOCKS5 独立内核固定为 v26.3.27，使用同号固定 TCP/UDP 端口。例如设置10000，
+客户端连接 TCP10000、UDP 关联返回 UDP10000。NAT 填公网 IPv4，同时映射同号 TCP/UDP。
+REALITY/SS 的 Xray 可以升级、降级，不会重启或改变独立 SOCKS5。
+独立二进制为 `/usr/local/bin/xray-socks5`，服务名 `reality-onekey-socks`，配置为
+`/etc/reality-onekey-socks/config.json`。只安装 SOCKS5 不下载主内核或 Geo 数据。
+固定版本官方 AMD64/ARM64 Release ZIP 使用固定 SHA256 校验后安装；未来更换这个版本
+需要重新验证固定 UDP 端口行为，不能跟随主 Xray 自动更新。
+旧版共用 SOCKS5 不会因菜单6更新脚本而自动迁移。菜单2 → SOCKS5 保持原参数确认后迁移，
+账号、密码、端口、名称默认保留；首次迁移会移除旧入站，必要时短暂重启主 Xray。
+后续安装、修改、删除独立 SOCKS5 不会重启 REALITY/SS，失败时恢复原配置。
 本功能不支持将 SOCKS5 公网端口映射为不同的内部端口，也不支持 IPv6-only UDP
 转发地址。域名可以用于连接服务器，但 UDP 转发地址需单独填写 IPv4。
 
@@ -121,7 +126,7 @@ SOCKS5 本身不加密，包括用户名/密码认证；请在可信网络或加
 
 “删除节点”会先选择协议，只删除对应节点并保留另一种协议；删除最后一个节点时才移除
 共用服务。Xray 二进制、Geo 数据及 `reality`、`x` 管理命令仍会保留。“完全卸载”
-会删除全部三种节点、Xray、Geo 数据、管理脚本与 `x` 快捷命令，并立即退出菜单。脚本不会
+会删除全部三种节点、两套 Xray 二进制及服务、配置、日志、Geo 数据、管理脚本与 `x` 快捷命令，并立即退出菜单。脚本不会
 修改云安全组，也不会删除系统中原有的 curl、unzip、OpenSSL 等公共依赖。
 
 ## 安全说明
