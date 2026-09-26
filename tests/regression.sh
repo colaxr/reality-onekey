@@ -9,6 +9,7 @@ export REALITY_PROC_ROOT="$TEST_ROOT/proc"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 # shellcheck disable=SC1090
 source <(sed '$d' reality.sh)
+ORIGINAL_MANAGED_LISTENERS="$(declare -f managed_listeners)"
 
 # No service, package manager or system file is changed by these mocks.
 sleep() { :; }
@@ -180,4 +181,63 @@ menu_output="$(printf '1\n' | protocol_menu show)"
   echo 'FAIL: installed-node submenu is not dynamic'; exit 1;
 }
 unset -f chmod install
+
+# SOCKS credentials survive quoting, and every nonempty protocol combination
+# preserves identities while publishing the right TCP/UDP health requirements.
+eval "$ORIGINAL_MANAGED_LISTENERS"
+install() {
+  if [[ "$1" == -d ]]; then mkdir -p "${!#}"; else /usr/bin/install "$@"; fi
+}
+write_ss_env 192.0.2.1 28388 aes-256-gcm test-pass 'SS Test'
+write_socks_env 192.0.2.1 31080 'user@"test' 'p@ss:word\test' 'SOCKS Test' 192.0.2.1
+load_socks
+[[ "$SOCKS_USER" == 'user@"test' && "$SOCKS_PASSWORD" == 'p@ss:word\test' ]]
+ports_conflict reality 31080 >/dev/null || { echo 'FAIL: SOCKS port conflict missed'; exit 1; }
+if ports_conflict socks 31080 >/dev/null; then echo 'FAIL: SOCKS conflicts with itself'; exit 1; fi
+validate_ipv4 192.0.2.1
+if validate_ipv4 256.0.0.1 || validate_ipv4 01.2.3.4 || validate_socks_credential $'bad\nuser'; then
+  echo 'FAIL: invalid SOCKS input accepted'; exit 1
+fi
+cp "$ENV_FILE" "$TEST_ROOT/reality.saved"
+cp "$SS_ENV_FILE" "$TEST_ROOT/ss.saved"
+cp "$SOCKS_ENV_FILE" "$TEST_ROOT/socks.saved"
+for mask in 1 2 3 4 5 6 7; do
+  rm -f "$ENV_FILE" "$SS_ENV_FILE" "$SOCKS_ENV_FILE"
+  (( mask & 1 )) && cp "$TEST_ROOT/reality.saved" "$ENV_FILE"
+  (( mask & 2 )) && cp "$TEST_ROOT/ss.saved" "$SS_ENV_FILE"
+  (( mask & 4 )) && cp "$TEST_ROOT/socks.saved" "$SOCKS_ENV_FILE"
+  rebuild_config "$TEST_ROOT/combination.json"
+  node -e '
+const c=JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+const mask=Number(process.argv[2]);
+if(c.inbounds.length!==[1,2,4].filter(x=>mask&x).length) process.exit(1);
+const s=c.inbounds.find(x=>x.tag==="socks-in");
+if(Boolean(s)!==Boolean(mask&4)) process.exit(2);
+if(s && (s.settings.auth!=="password" || s.settings.udp!==true || s.settings.ip!=="192.0.2.1" ||
+ s.settings.accounts[0].user!=="user@\"test" || s.settings.accounts[0].pass!=="p@ss:word\\test")) process.exit(3);
+const r=c.inbounds.find(x=>x.tag==="reality-in");
+if(r && r.settings.clients[0].id!=="11111111-1111-4111-8111-111111111111") process.exit(4);
+' "$TEST_ROOT/combination.json" "$mask"
+  if (( mask & 4 )); then
+    listeners="$(managed_listeners)"
+    [[ "$listeners" == *'tcp 31080'* && "$listeners" == *'udp 31080'* ]]
+  fi
+done
+show_socks() { printf 'SHOW_SOCKS\n'; }
+menu_output="$(printf '3\n' | protocol_menu show)"
+[[ "$menu_output" == *'SOCKS5'* && "$menu_output" == *'SHOW_SOCKS'* ]]
+# Exercise actual per-protocol removal, but never start a system service.
+apply_node_change() { rebuild_config "$CONFIG_FILE.new" && mv "$CONFIG_FILE.new" "$CONFIG_FILE"; }
+remove_node_files() { rm -rf -- "$APP_DIR"; }
+mktemp() { /usr/bin/mktemp -d "$TEST_ROOT/delete.XXXXXX"; }
+delete_protocol socks --yes >/dev/null
+[[ ! -f "$SOCKS_ENV_FILE" && -f "$ENV_FILE" && -f "$SS_ENV_FILE" ]]
+node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1])); if(c.inbounds.length!==2 || c.inbounds.some(x=>x.tag==="socks-in")) process.exit(1)' "$CONFIG_FILE"
+menu_output="$(printf '1\n' | protocol_menu show)"
+[[ "$menu_output" != *'SOCKS5'* ]]
+delete_protocol ss --yes >/dev/null
+[[ -f "$ENV_FILE" && ! -f "$SS_ENV_FILE" ]]
+delete_protocol reality --yes >/dev/null
+[[ ! -d "$APP_DIR" ]]
+unset -f install mktemp
 echo 'Regression checks passed'

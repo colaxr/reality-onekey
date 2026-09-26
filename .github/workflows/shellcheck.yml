@@ -25,3 +25,19 @@ jobs:
             printf '::error::%s\n' "$line"
           done < /tmp/shellcheck.txt
           exit "${result:-0}"
+  socks-runtime:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: [v26.3.27, v26.7.28, v26.9.9]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download official Xray for loopback integration test
+        env:
+          XRAY_TEST_VERSION: ${{ matrix.version }}
+        run: |
+          curl -fL --retry 3 "https://github.com/XTLS/Xray-core/releases/download/${XRAY_TEST_VERSION}/Xray-linux-64.zip" -o "$RUNNER_TEMP/xray-test.zip"
+          unzip -oq "$RUNNER_TEMP/xray-test.zip" -d "$RUNNER_TEMP/xray-test"
+          chmod +x "$RUNNER_TEMP/xray-test/xray"
+      - name: Real SOCKS5 authentication, TCP and UDP
+        run: python3 tests/socks_runtime.py "$RUNNER_TEMP/xray-test/xray"

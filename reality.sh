@@ -12,6 +12,7 @@ readonly SHORTCUT_BIN="${ROOT_PREFIX}/usr/local/bin/x"
 readonly CONFIG_FILE="${APP_DIR}/config.json"
 readonly ENV_FILE="${APP_DIR}/node.env"
 readonly SS_ENV_FILE="${APP_DIR}/ss.env"
+readonly SOCKS_ENV_FILE="${APP_DIR}/socks.env"
 readonly SYSTEMD_FILE="${ROOT_PREFIX}/etc/systemd/system/${APP_NAME}.service"
 readonly OPENRC_FILE="${ROOT_PREFIX}/etc/init.d/${APP_NAME}"
 readonly RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
@@ -286,7 +287,7 @@ restore_config_permissions() {
   chmod 750 "$APP_DIR" || return 1
   chmod 640 "$CONFIG_FILE" || return 1
   local file
-  for file in "$ENV_FILE" "$SS_ENV_FILE"; do
+  for file in "$ENV_FILE" "$SS_ENV_FILE" "$SOCKS_ENV_FILE"; do
     [[ -f "$file" ]] || continue
     chown root:root "$file" && chmod 600 "$file" || return 1
   done
@@ -366,6 +367,12 @@ managed_listeners() {
     . "$SS_ENV_FILE"
     validate_port "${SS_PORT:-}" || return 1
     printf 'tcp %s\nudp %s\n' "$SS_PORT" "$SS_PORT"
+  fi
+  if [[ -r "$SOCKS_ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    . "$SOCKS_ENV_FILE"
+    validate_port "${SOCKS_PORT:-}" || return 1
+    printf 'tcp %s\nudp %s\n' "$SOCKS_PORT" "$SOCKS_PORT"
   fi
 }
 
@@ -476,6 +483,48 @@ load_ss() {
   }
 }
 
+validate_socks_credential() {
+  local LC_ALL=C
+  [[ -n "$1" && ${#1} -le 255 && ! "$1" =~ [[:cntrl:]] ]]
+}
+
+validate_ipv4() {
+  local ip="$1" octet
+  local -a octets=()
+  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  IFS=. read -r -a octets <<<"$ip"
+  for octet in "${octets[@]}"; do
+    [[ ${#octet} -le 3 && ( "$octet" == 0 || "$octet" != 0* ) ]] || return 1
+    (( 10#$octet <= 255 )) || return 1
+  done
+}
+
+load_socks() {
+  if [[ ! -r "$SOCKS_ENV_FILE" ]]; then
+    [[ "${1:-}" == quiet ]] || yellow "尚未安装 SOCKS5 节点。"
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  . "$SOCKS_ENV_FILE"
+  SOCKS_USER="$(base64_decode "$SOCKS_USER_B64" 2>/dev/null)" || return 1
+  SOCKS_PASSWORD="$(base64_decode "$SOCKS_PASSWORD_B64" 2>/dev/null)" || return 1
+  validate_socks_credential "$SOCKS_USER" && validate_socks_credential "$SOCKS_PASSWORD" &&
+    validate_ipv4 "$SOCKS_UDP_IP" && validate_port "$SOCKS_PORT"
+}
+
+write_socks_env() {
+  install -d -m700 "$APP_DIR"
+  cat >"$SOCKS_ENV_FILE" <<EOF
+SOCKS_SERVER_IP='$1'
+SOCKS_PORT='$2'
+SOCKS_USER_B64='$(base64_encode "$3")'
+SOCKS_PASSWORD_B64='$(base64_encode "$4")'
+SOCKS_NODE_NAME='$5'
+SOCKS_UDP_IP='$6'
+EOF
+  chmod 600 "$SOCKS_ENV_FILE"
+}
+
 write_reality_env() {
   local port="$1" uuid="$2" domain="$3" dest="$4" public_key="$6"
   local short_id="$7" server_ip="$8" fingerprint="$9" node_name="${10}" xudp_enabled="${11}"
@@ -514,7 +563,7 @@ EOF
 # shellcheck disable=SC2153
 rebuild_config() {
   local output="${1:-$CONFIG_FILE}" comma="" private_key ss_password
-  [[ -r "$ENV_FILE" || -r "$SS_ENV_FILE" ]] || return 1
+  [[ -r "$ENV_FILE" || -r "$SS_ENV_FILE" || -r "$SOCKS_ENV_FILE" ]] || return 1
   # Rendering a candidate must not change permissions of the live directory.
   [[ -d "$APP_DIR" ]] || install -d -m700 "$APP_DIR" || return 1
   {
@@ -574,6 +623,26 @@ EOF
     }
   }
 EOF
+      comma=,
+    fi
+    if [[ -r "$SOCKS_ENV_FILE" ]]; then
+      load_socks quiet || { yellow "SOCKS5 参数损坏，配置未应用。" >&2; return 1; }
+      printf '%s\n' "$comma"
+      # accounts is supported by both older and newer Xray releases.
+      cat <<EOF
+  {
+    "tag": "socks-in",
+    "listen": "0.0.0.0",
+    "port": ${SOCKS_PORT},
+    "protocol": "socks",
+    "settings": {
+      "auth": "password",
+      "accounts": [{ "user": "$(json_escape "$SOCKS_USER")", "pass": "$(json_escape "$SOCKS_PASSWORD")" }],
+      "udp": true,
+      "ip": "$(json_escape "$SOCKS_UDP_IP")"
+    }
+  }
+EOF
     fi
     cat <<'EOF'
   ],
@@ -608,6 +677,10 @@ ports_conflict() {
   fi
   if [[ "$protocol" != ss ]] && load_ss quiet && [[ "$SS_PORT" == "$port" ]]; then
     yellow "端口 ${port} 已被 Shadowsocks 节点使用。"
+    return 0
+  fi
+  if [[ "$protocol" != socks ]] && load_socks quiet && [[ "$SOCKS_PORT" == "$port" ]]; then
+    yellow "端口 ${port} 已被 SOCKS5 节点使用。"
     return 0
   fi
   return 1
@@ -646,7 +719,7 @@ apply_node_change() {
   rm -rf -- "$candidate_dir"
   if ! make_service; then
     restore_state "$backup" || { yellow "原配置恢复失败，请检查文件与权限。"; return 1; }
-    if [[ -r "$ENV_FILE" || -r "$SS_ENV_FILE" ]]; then
+    if [[ -r "$ENV_FILE" || -r "$SS_ENV_FILE" || -r "$SOCKS_ENV_FILE" ]]; then
       service_restart || yellow "原配置也未能启动，请检查上述日志。"
     else
       remove_node_files
@@ -839,9 +912,68 @@ edit_ss() {
   fi
 }
 
+configure_socks() {
+  local action="${1:-install}" server_ip port username password node_name udp_ip udp_default backup
+  local current_server="" current_port=1080 current_user=socks current_password="" current_name="" current_udp=""
+  if [[ "$action" == edit ]]; then
+    load_socks || return 1
+    current_server="$SOCKS_SERVER_IP"; current_port="$SOCKS_PORT"
+    current_user="$SOCKS_USER"; current_password="$SOCKS_PASSWORD"
+    current_name="$SOCKS_NODE_NAME"; current_udp="$SOCKS_UDP_IP"
+  else
+    install_common
+    current_server="$(public_ip)"
+  fi
+  info "SOCKS5 启用用户名/密码认证及 TCP + UDP；协议本身不加密。"
+  server_ip="$(prompt "服务器公网 IP/域名" "$current_server")"
+  validate_server_address "$server_ip" || { yellow "服务器地址格式不正确。"; return 1; }
+  port="$(prompt "监听端口" "$current_port")"
+  validate_port "$port" || { yellow "端口必须是 1-65535 的整数。"; return 1; }
+  ports_conflict socks "$port" && return 1
+  udp_default="${current_udp:-$server_ip}"
+  if ! validate_ipv4 "$udp_default"; then
+    udp_default="$(public_ip)"
+    validate_ipv4 "$udp_default" || udp_default=""
+  fi
+  udp_ip="$(prompt "UDP 转发公网 IPv4（客户端可达；NAT 填映射公网 IP）" "$udp_default")"
+  validate_ipv4 "$udp_ip" || { yellow "UDP 转发地址必须是有效 IPv4。"; return 1; }
+  username="$(prompt "用户名" "$current_user")"
+  validate_socks_credential "$username" || { yellow "用户名必须为 1-255 字节，不能包含控制字符。"; return 1; }
+  password="$(prompt "密码（安装时留空自动生成；修改时留空保持）" "$current_password")"
+  [[ -n "$password" ]] || password="$(openssl rand -hex 16)"
+  validate_socks_credential "$password" || { yellow "密码必须为 1-255 字节，不能包含控制字符。"; return 1; }
+  node_name="$(prompt "节点名称" "${current_name:-SOCKS5-${server_ip}}")"
+  validate_node_name "$node_name" || { yellow "节点名称格式不正确。"; return 1; }
+  backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
+  backup_state "$backup" || { rm -rf -- "$backup"; return 1; }
+  write_socks_env "$server_ip" "$port" "$username" "$password" "$node_name" "$udp_ip"
+  if apply_node_change "$backup" "SOCKS5 配置完成。请放行 TCP/UDP ${port}；NAT 两种协议需使用与监听端口相同的公网端口。"; then
+    rm -rf -- "$backup"
+    show_socks
+  else
+    rm -rf -- "$backup"
+    return 1
+  fi
+}
+
+show_socks() {
+  load_socks || return 1
+  local host="$SOCKS_SERVER_IP"
+  [[ "$host" == *:* && "$host" != \[*\] ]] && host="[$host]"
+  printf '\nSOCKS5 节点信息\n名称：%s\n服务器：%s\n端口：%s\n用户名：%s\n密码：%s\nUDP 转发 IPv4：%s\n网络：TCP + UDP\n' \
+    "$SOCKS_NODE_NAME" "$SOCKS_SERVER_IP" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASSWORD" "$SOCKS_UDP_IP"
+  info "客户端需支持 SOCKS5 UDP ASSOCIATE；如不识别链接，请按上述字段手动添加。"
+  green "socks5://$(urlencode "$SOCKS_USER"):$(urlencode "$SOCKS_PASSWORD")@${host}:${SOCKS_PORT}#$(urlencode "$SOCKS_NODE_NAME")"
+}
+
 delete_protocol() {
   local protocol="$1" answer="${2:-}" file label backup
-  if [[ "$protocol" == reality ]]; then file="$ENV_FILE"; label=REALITY; else file="$SS_ENV_FILE"; label=Shadowsocks; fi
+  case "$protocol" in
+    reality) file="$ENV_FILE"; label=REALITY ;;
+    ss) file="$SS_ENV_FILE"; label=Shadowsocks ;;
+    socks) file="$SOCKS_ENV_FILE"; label=SOCKS5 ;;
+    *) yellow "无效协议。"; return 1 ;;
+  esac
   [[ -r "$file" ]] || { yellow "尚未安装 ${label} 节点。"; return 1; }
   if [[ "$answer" != --yes ]]; then
     read -r -p "将删除 ${label} 节点，其他协议节点会保留，确定吗？[y/N]: " answer
@@ -850,7 +982,7 @@ delete_protocol() {
   backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
   backup_state "$backup"
   rm -f -- "$file"
-  if [[ ! -r "$ENV_FILE" && ! -r "$SS_ENV_FILE" ]]; then
+  if [[ ! -r "$ENV_FILE" && ! -r "$SS_ENV_FILE" && ! -r "$SOCKS_ENV_FILE" ]]; then
     remove_node_files
     rm -rf -- "$backup"
     green "已删除 ${label} 节点；当前没有其他节点，服务已移除，Xray 和管理命令仍保留。"
@@ -867,7 +999,7 @@ delete_protocol() {
 uninstall_reality() {
   local answer="${1:-}"
   if [[ "$answer" != "--yes" ]]; then
-    read -r -p "将完全删除 Xray、REALITY/SS 配置、服务和日志，确定吗？[y/N]: " answer
+    read -r -p "将完全删除 Xray、REALITY/SS/SOCKS5 配置、服务和日志，确定吗？[y/N]: " answer
     [[ "$answer" =~ ^[Yy]$ ]] || { yellow "已取消。"; return; }
   fi
   remove_node_files
@@ -967,7 +1099,7 @@ update_xray() {
   if [[ -r "$ENV_FILE" ]]; then
     green "Xray 已更新到 ${target}；全部节点身份和分享链接保持不变，REALITY 最低客户端版本为 ${MIN_CLIENT_VERSION}。"
   else
-    green "Xray 已更新到 ${target}；Shadowsocks 节点身份和分享链接保持不变。"
+    green "Xray 已更新到 ${target}；全部节点身份和连接信息保持不变。"
   fi
 }
 
@@ -1004,11 +1136,12 @@ protocol_menu() {
   local -a protocols=() labels=()
   if [[ "$action" == install ]]; then
     while true; do
-      printf '\n请选择节点类型\n1. REALITY\n2. Shadowsocks（SS，TCP + UDP）\n0. 返回主菜单\n'
-      read -r -p "请选择 [0-2]: " choice
+      printf '\n请选择节点类型\n1. REALITY\n2. Shadowsocks（SS，TCP + UDP）\n3. SOCKS5（TCP + UDP）\n0. 返回主菜单\n'
+      read -r -p "请选择 [0-3]: " choice
       case "$choice" in
         1) install_reality || true; return ;;
         2) install_ss || true; return ;;
+        3) configure_socks install || true; return ;;
         0) return ;;
         *) yellow "无效选项。" ;;
       esac
@@ -1022,6 +1155,10 @@ protocol_menu() {
   if [[ -r "$SS_ENV_FILE" ]]; then
     protocols+=(ss)
     labels+=("Shadowsocks（SS，TCP + UDP）")
+  fi
+  if [[ -r "$SOCKS_ENV_FILE" ]]; then
+    protocols+=(socks)
+    labels+=("SOCKS5（TCP + UDP）")
   fi
   if (( ${#protocols[@]} == 0 )); then
     yellow "未发现已安装的节点。"
@@ -1045,10 +1182,13 @@ protocol_menu() {
     case "${action}:${selected}" in
       edit:reality) edit_node || true ;;
       edit:ss) edit_ss || true ;;
+      edit:socks) configure_socks edit || true ;;
       show:reality) show_reality || true ;;
       show:ss) show_ss || true ;;
+      show:socks) show_socks || true ;;
       delete:reality) delete_protocol reality || true ;;
       delete:ss) delete_protocol ss || true ;;
+      delete:socks) delete_protocol socks || true ;;
       *) yellow "无效操作。" ;;
     esac
     return 0
@@ -1085,22 +1225,26 @@ main() {
     install) protocol_menu install ;;
     install-reality) install_reality ;;
     install-ss) install_ss ;;
+    install-socks) configure_socks install ;;
     edit) protocol_menu edit ;;
     edit-reality) edit_node ;;
     edit-ss) edit_ss ;;
+    edit-socks) configure_socks edit ;;
     show) protocol_menu show ;;
     show-reality) show_reality ;;
     show-ss) show_ss ;;
+    show-socks) show_socks ;;
     status) service_status ;;
     update) update_xray ;;
     self-update) update_script ;;
     remove-node) protocol_menu delete ;;
     remove-reality) delete_protocol reality "${2:-}" ;;
     remove-ss) delete_protocol ss "${2:-}" ;;
+    remove-socks) delete_protocol socks "${2:-}" ;;
     uninstall) uninstall_reality "${2:-}" ;;
     menu) menu ;;
     -h|--help)
-      printf '用法: %s [install|install-reality|install-ss|edit|edit-reality|edit-ss|show|show-reality|show-ss|status|update|self-update|remove-node|remove-reality [--yes]|remove-ss [--yes]|uninstall [--yes]|menu]\n' "$0"
+      printf '用法: %s [install|install-reality|install-ss|install-socks|edit|edit-reality|edit-ss|edit-socks|show|show-reality|show-ss|show-socks|status|update|self-update|remove-node|remove-reality [--yes]|remove-ss [--yes]|remove-socks [--yes]|uninstall [--yes]|menu]\n' "$0"
       ;;
     *) die "未知命令：$1" ;;
   esac

@@ -39,7 +39,7 @@ verify_service() {
   [[ "$(stat -c '%a' "$CONFIG_FILE")" == 640 ]] || return 1
   runuser -u nobody -- cat "$CONFIG_FILE" >/dev/null || return 1
   local file
-  for file in "$ENV_FILE" "$SS_ENV_FILE"; do
+  for file in "$ENV_FILE" "$SS_ENV_FILE" "$SOCKS_ENV_FILE"; do
     [[ -f "$file" ]] || continue
     [[ "$(stat -c '%a' "$file")" == 600 ]] || return 1
     if runuser -u nobody -- test -r "$file"; then return 1; fi
@@ -49,17 +49,24 @@ write_reality_env 24443 11111111-1111-4111-8111-111111111111 example.com example
   unused public-test aabbccdd 192.0.2.1 chrome 'Permission Test' true
 export PRIVATE_KEY='CNbUQuA6-wuMRF2DIaS6R3CUJBa7CGO0wLE8Aj0HoH0'
 write_ss_env 192.0.2.1 28388 aes-256-gcm test-password 'SS Test'
+write_socks_env 192.0.2.1 31080 test-user test-password 'SOCKS Test' 192.0.2.1
 rebuild_config
 restore_config_permissions
+cp "$SOCKS_ENV_FILE" "$TEST_ROOT/socks.saved"
 
 # Candidate generation must preserve access to the currently running config.
 rebuild_config "$TEST_ROOT/candidate.json"
 verify_service || { echo 'FAIL: rendering changed live permissions'; exit 1; }
 
 # Updates, including SS-only, must allow the service user to read the config.
-for protocol in combined ss-only; do
+for protocol in combined ss-only socks-only; do
   if [[ "$protocol" == ss-only ]]; then
-    rm -f "$ENV_FILE"
+    rm -f "$ENV_FILE" "$SOCKS_ENV_FILE"
+    rebuild_config
+    restore_config_permissions
+  elif [[ "$protocol" == socks-only ]]; then
+    rm -f "$ENV_FILE" "$SS_ENV_FILE"
+    cp "$TEST_ROOT/socks.saved" "$SOCKS_ENV_FILE"
     rebuild_config
     restore_config_permissions
   fi
