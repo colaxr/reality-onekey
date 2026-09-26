@@ -533,7 +533,7 @@ load_socks() {
 }
 
 write_socks_env() {
-  install -d -m700 "$APP_DIR"
+  [[ -d "$APP_DIR" ]] || install -d -m700 "$APP_DIR" || return 1
   cat >"$SOCKS_ENV_FILE" <<EOF
 SOCKS_SERVER_IP='$1'
 SOCKS_PORT='$2'
@@ -713,8 +713,9 @@ ports_conflict() {
 
 backup_state() {
   local target="$1"
-  mkdir -p "$target"
-  [[ -d "$APP_DIR" ]] && cp -a "$APP_DIR/." "$target/"
+  mkdir -p "$target" || return 1
+  if [[ -d "$APP_DIR" ]]; then cp -a "$APP_DIR/." "$target/" || return 1; fi
+  return 0
 }
 
 restore_state() {
@@ -1223,7 +1224,7 @@ delete_protocol() {
   if ! has_xray_nodes; then
     remove_node_files
     rm -rf -- "$backup"
-    green "已删除 ${label} 节点；当前没有其他节点，服务已移除，Xray 和管理命令仍保留。"
+    green "已删除 ${label} 节点及 Xray 节点服务；独立 SOCKS5（如有）继续运行，Xray 和管理命令仍保留。"
     return 0
   fi
   if apply_node_change "$backup" "已删除 ${label} 节点，其他节点继续运行。"; then

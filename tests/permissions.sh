@@ -89,4 +89,19 @@ backup_state "$TEST_ROOT/state"
 chmod 700 "$TEST_ROOT/state"
 restore_state "$TEST_ROOT/state"
 verify_service || { echo 'FAIL: restored node permissions'; exit 1; }
+
+# Dedicated daemon config is readable by nobody; metadata is still root-only.
+write_socks_env 192.0.2.1 31080 test-user test-password Test 192.0.2.1 hev
+install -d -m700 "$SOCKS_DIR"
+render_socks_config >"$SOCKS_CONFIG"
+socks_permissions
+runuser -u nobody -- cat "$SOCKS_CONFIG" >/dev/null
+if runuser -u nobody -- test -r "$SOCKS_ENV_FILE"; then
+  echo 'FAIL: dedicated SOCKS metadata exposed'; exit 1
+fi
+[[ "$(stat -c '%a' "$SOCKS_DIR")" == 750 && "$(stat -c '%a' "$SOCKS_CONFIG")" == 640 ]]
+rm -f -- "$CONFIG_FILE"
+chmod 700 "$APP_DIR" "$SOCKS_DIR"
+socks_permissions
+runuser -u nobody -- cat "$SOCKS_CONFIG" >/dev/null
 echo 'Real service-user permission checks passed'

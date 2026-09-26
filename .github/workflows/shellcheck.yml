@@ -28,13 +28,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Bash syntax and regression checks
         run: |
-          bash -n reality.sh install.sh tests/regression.sh tests/permissions.sh
+          bash -n reality.sh install.sh tests/regression.sh tests/permissions.sh tests/independent_lifecycle.sh
           bash tests/regression.sh
+          bash tests/independent_lifecycle.sh
       - name: Real service-user permission checks
         run: sudo bash tests/permissions.sh
       - name: Run ShellCheck
         run: |
-          shellcheck --format=gcc reality.sh install.sh tests/regression.sh tests/permissions.sh > /tmp/shellcheck.txt || result=$?
+          shellcheck --format=gcc reality.sh install.sh tests/regression.sh tests/permissions.sh tests/independent_lifecycle.sh > /tmp/shellcheck.txt || result=$?
           while IFS= read -r line; do
             printf '::error::%s\n' "$line"
           done < /tmp/shellcheck.txt
