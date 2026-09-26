@@ -1042,6 +1042,7 @@ socks_permissions() {
 
 socks_restart() {
   local pid previous="" stable=0 attempt
+  SERVICE_FALLBACK_USED=false
   socks_permissions || return 1
   if [[ "$INIT" == systemd ]]; then
     systemctl restart "$SOCKS_NAME" || return 1
@@ -1062,7 +1063,12 @@ socks_restart() {
     if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null && service_listening "$pid" "$SOCKS_PORT" && service_udp_listening "$pid" "$SOCKS_PORT"; then
       if [[ "$pid" == "$previous" ]]; then stable=$((stable + 1)); else stable=1; fi
       previous="$pid"
-      (( stable < 3 )) || return 0
+      if (( stable >= 3 )); then
+        if [[ "$SERVICE_FALLBACK_USED" == true ]]; then
+          yellow "当前环境限制读取 SOCKS5 进程 fd，已使用稳定 PID 与 TCP/UDP 监听的备用检查。"
+        fi
+        return 0
+      fi
     else
       stable=0; previous=""
     fi
@@ -1199,7 +1205,7 @@ configure_socks() {
   backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
   backup_state "$backup" || { rm -rf -- "$backup"; return 1; }
   if ! download_socks; then rm -rf -- "$backup"; return 1; fi
-  if [[ -f "$SOCKS_CONFIG" ]] && ! cp -a "$SOCKS_CONFIG" "$backup.json"; then
+  if [[ -f "$SOCKS_CONFIG" ]] && ! install -m600 -o root -g root "$SOCKS_CONFIG" "$backup.json"; then
     rm -rf -- "$backup"; return 1
   fi
   if ! write_socks_env "$server_ip" "$port" "$username" "$password" "$node_name" "$udp_ip" xray-fixed; then
