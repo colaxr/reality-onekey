@@ -53,6 +53,8 @@ fi
 unset -f ip
 write_socks_env 192.0.2.1 31080 test-user test-pass Test 192.0.2.1 xray-fixed
 render_socks_config >"$TEST_ROOT/socks-default.json"
+write_socks_env 192.0.2.1 31080 test-user test-pass Test 192.0.2.1 xray-fixed '' ipv4
+render_socks_config >"$TEST_ROOT/socks-auto-ipv4.json"
 write_socks_env 192.0.2.1 31080 test-user test-pass Test 192.0.2.1 xray-fixed '' ipv6
 render_socks_config >"$TEST_ROOT/socks-auto-ipv6.json"
 write_socks_env 192.0.2.1 31080 test-user test-pass Test 192.0.2.1 xray-fixed 2001:db8::10
@@ -61,19 +63,21 @@ write_socks_env 192.0.2.1 31080 test-user test-pass Test 192.0.2.1 xray-fixed 19
 render_socks_config >"$TEST_ROOT/socks-ipv4.json"
 node -e '
 const fs = require("fs");
-const [original, automatic, ipv6, ipv4] = process.argv.slice(1).map(p => JSON.parse(fs.readFileSync(p)));
+const [original, automatic4, automatic6, ipv6, ipv4] = process.argv.slice(1).map(p => JSON.parse(fs.readFileSync(p)));
 const out = c => c.outbounds[0];
 if (JSON.stringify(out(original)) !== JSON.stringify({protocol:"freedom",tag:"direct"})) process.exit(1);
-if (Object.hasOwn(out(automatic), "sendThrough") ||
-    out(automatic).settings.domainStrategy !== "ForceIPv6" ||
-    out(automatic).streamSettings.sockopt.domainStrategy !== "ForceIPv6" ||
-    automatic.inbounds[0].settings.ip !== "192.0.2.1") process.exit(3);
+for (const [config, strategy] of [[automatic4,"ForceIPv4"],[automatic6,"ForceIPv6"]]) {
+  if (Object.hasOwn(out(config), "sendThrough") ||
+      out(config).settings.domainStrategy !== strategy ||
+      out(config).streamSettings.sockopt.domainStrategy !== strategy ||
+      config.inbounds[0].settings.ip !== "192.0.2.1") process.exit(3);
+}
 for (const [config, ip, strategy] of [[ipv6,"2001:db8::10","ForceIPv6"],[ipv4,"192.0.2.10","ForceIPv4"]]) {
   if (out(config).sendThrough !== ip || out(config).settings.domainStrategy !== strategy ||
       out(config).streamSettings.sockopt.domainStrategy !== strategy ||
       config.inbounds[0].settings.ip !== "192.0.2.1") process.exit(2);
 }
-' "$TEST_ROOT/socks-default.json" "$TEST_ROOT/socks-auto-ipv6.json" "$TEST_ROOT/socks-ipv6.json" "$TEST_ROOT/socks-ipv4.json"
+' "$TEST_ROOT/socks-default.json" "$TEST_ROOT/socks-auto-ipv4.json" "$TEST_ROOT/socks-auto-ipv6.json" "$TEST_ROOT/socks-ipv6.json" "$TEST_ROOT/socks-ipv4.json"
 write_socks_env 192.0.2.1 31080 test-user test-pass Test 192.0.2.1 xray-fixed
 apply_socks_change "$TEST_ROOT/new-backup" >/dev/null
 [[ "$X_RESTARTS" == 0 ]]

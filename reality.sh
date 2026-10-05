@@ -560,7 +560,7 @@ load_socks() {
   validate_socks_credential "$SOCKS_USER" && validate_socks_credential "$SOCKS_PASSWORD" &&
     validate_ipv4 "$SOCKS_UDP_IP" && validate_port "$SOCKS_PORT" || return 1
   case "$SOCKS_OUTBOUND_MODE" in
-    default|ipv6) [[ -z "$SOCKS_OUTBOUND_IP" ]] ;;
+    default|ipv4|ipv6) [[ -z "$SOCKS_OUTBOUND_IP" ]] ;;
     fixed) [[ -n "$SOCKS_OUTBOUND_IP" ]] &&
       { [[ "$SOCKS_OUTBOUND_IP" == *:* ]] || validate_ipv4 "$SOCKS_OUTBOUND_IP"; } ;;
     *) return 1 ;;
@@ -1225,7 +1225,7 @@ apply_socks_change() {
 
 configure_socks() {
   local action="${1:-install}" server_ip port username password node_name udp_ip udp_default backup outbound_ip outbound_mode outbound_input
-  local current_server="" current_port=1080 current_user=socks current_password="" current_name="" current_udp="" current_outbound="" current_mode=default
+  local current_server="" current_port=1080 current_user=socks current_password="" current_name="" current_udp="" current_outbound="" current_mode=default current_label=""
   if [[ "$action" == edit ]]; then
     load_socks || return 1
     current_server="$SOCKS_SERVER_IP"; current_port="$SOCKS_PORT"
@@ -1252,17 +1252,24 @@ configure_socks() {
   udp_ip="$(prompt "UDP 转发公网 IPv4（客户端可达；NAT 填映射公网 IP）" "$udp_default")"
   validate_ipv4 "$udp_ip" || { yellow "UDP 转发地址必须是有效 IPv4。"; return 1; }
   if [[ "$action" == edit && "$current_mode" != default ]]; then
-    read -r -p "出站方式 [${current_outbound:-自动 IPv6}]（留空保持；auto 恢复 VPS 默认；ipv6 自动 IPv6；或填本机 IP）: " outbound_input
+    case "$current_mode" in
+      ipv4) current_label="自动 IPv4" ;;
+      ipv6) current_label="自动 IPv6" ;;
+      fixed) current_label="$current_outbound" ;;
+    esac
+    read -r -p "出站方式 [${current_label}]（留空保持；auto 恢复默认；ipv4/ipv6 自动选址；或填本机 IP）: " outbound_input
     case "$outbound_input" in
       '') outbound_mode="$current_mode"; outbound_ip="$current_outbound" ;;
       auto) outbound_mode=default; outbound_ip="" ;;
+      ipv4) outbound_mode=ipv4; outbound_ip="" ;;
       ipv6) outbound_mode=ipv6; outbound_ip="" ;;
       *) outbound_mode=fixed; outbound_ip="$outbound_input" ;;
     esac
   else
-    read -r -p "出站方式（留空 VPS 默认；输入 ipv6 自动走 IPv6；或填本机 IPv4/IPv6）: " outbound_input
+    read -r -p "出站方式（留空 VPS 默认；输入 ipv4/ipv6 自动选址；或填本机 IPv4/IPv6）: " outbound_input
     case "$outbound_input" in
       ''|auto) outbound_mode=default; outbound_ip="" ;;
+      ipv4) outbound_mode=ipv4; outbound_ip="" ;;
       ipv6) outbound_mode=ipv6; outbound_ip="" ;;
       *) outbound_mode=fixed; outbound_ip="$outbound_input" ;;
     esac
@@ -1307,6 +1314,7 @@ show_socks() {
   printf '\nSOCKS5 节点信息\n名称：%s\n服务器：%s\n端口：%s\n用户名：%s\n密码：%s\nUDP 转发 IPv4：%s\n网络：TCP + UDP\n' \
     "$SOCKS_NODE_NAME" "$SOCKS_SERVER_IP" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASSWORD" "$SOCKS_UDP_IP"
   case "$SOCKS_OUTBOUND_MODE" in
+    ipv4) printf '出站方式：自动 IPv4（公网出口由 VPS/宿主机决定）\n' ;;
     ipv6) printf '出站方式：自动 IPv6（公网出口由 VPS/宿主机决定）\n' ;;
     fixed) printf '出站源 IP：%s\n' "$SOCKS_OUTBOUND_IP" ;;
     *) printf '出站方式：VPS 默认\n' ;;
