@@ -522,19 +522,36 @@ validate_ipv4() {
   done
 }
 
+# Only an address assigned to this VPS can be used as an outbound source.
+# `ip addr show` works with both iproute2 and Alpine's BusyBox ip applet.
+validate_local_outbound_ip() {
+  local address="$1"
+  [[ -n "$address" && "$address" != *%* && "$address" != */* ]] || return 1
+  command -v ip >/dev/null 2>&1 || return 1
+  ip addr show 2>/dev/null | awk -v wanted="$address" '
+    $1 == "inet" || $1 == "inet6" {
+      split($2, parts, "/")
+      if (tolower(parts[1]) == tolower(wanted)) found=1
+    }
+    END { exit !found }
+  '
+}
+
 load_socks() {
   if [[ ! -r "$SOCKS_ENV_FILE" ]]; then
     [[ "${1:-}" == quiet ]] || yellow "尚未安装 SOCKS5 节点。"
     return 1
   fi
   SOCKS_BACKEND=xray
+  SOCKS_OUTBOUND_IP=""
   # shellcheck disable=SC1090
   . "$SOCKS_ENV_FILE"
   [[ "$SOCKS_BACKEND" == xray || "$SOCKS_BACKEND" == xray-fixed ]] || return 1
   SOCKS_USER="$(base64_decode "$SOCKS_USER_B64" 2>/dev/null)" || return 1
   SOCKS_PASSWORD="$(base64_decode "$SOCKS_PASSWORD_B64" 2>/dev/null)" || return 1
   validate_socks_credential "$SOCKS_USER" && validate_socks_credential "$SOCKS_PASSWORD" &&
-    validate_ipv4 "$SOCKS_UDP_IP" && validate_port "$SOCKS_PORT"
+    validate_ipv4 "$SOCKS_UDP_IP" && validate_port "$SOCKS_PORT" &&
+    { [[ -z "$SOCKS_OUTBOUND_IP" ]] || [[ "$SOCKS_OUTBOUND_IP" == *:* ]] || validate_ipv4 "$SOCKS_OUTBOUND_IP"; }
 }
 
 write_socks_env() {
@@ -547,6 +564,7 @@ SOCKS_PASSWORD_B64='$(base64_encode "$4")'
 SOCKS_NODE_NAME='$5'
 SOCKS_UDP_IP='$6'
 SOCKS_BACKEND='${7:-xray}'
+SOCKS_OUTBOUND_IP='${8:-}'
 EOF
   chmod 600 "$SOCKS_ENV_FILE"
 }
@@ -992,6 +1010,17 @@ download_socks() {
 
 render_socks_config() {
   load_socks quiet || return 1
+  local outbound='{ "protocol": "freedom", "tag": "direct" }' strategy
+  if [[ -n "$SOCKS_OUTBOUND_IP" ]]; then
+    if [[ "$SOCKS_OUTBOUND_IP" == *:* ]]; then
+      strategy=ForceIPv6
+    else
+      strategy=ForceIPv4
+    fi
+    # v26.3.27 Freedom uses settings.domainStrategy for UDP packets;
+    # sockopt covers dialing and TCP destination resolution.
+    outbound="{ \"protocol\": \"freedom\", \"tag\": \"direct\", \"sendThrough\": \"$(json_escape "$SOCKS_OUTBOUND_IP")\", \"settings\": { \"domainStrategy\": \"${strategy}\" }, \"streamSettings\": { \"sockopt\": { \"domainStrategy\": \"${strategy}\" } } }"
+  fi
   cat <<EOF
 {
   "log": { "loglevel": "warning" },
@@ -1007,7 +1036,7 @@ render_socks_config() {
       "ip": "${SOCKS_UDP_IP}"
     }
   }],
-  "outbounds": [{ "protocol": "freedom", "tag": "direct" }]
+  "outbounds": [${outbound}]
 }
 EOF
 }
@@ -1173,13 +1202,13 @@ apply_socks_change() {
 }
 
 configure_socks() {
-  local action="${1:-install}" server_ip port username password node_name udp_ip udp_default backup
-  local current_server="" current_port=1080 current_user=socks current_password="" current_name="" current_udp=""
+  local action="${1:-install}" server_ip port username password node_name udp_ip udp_default backup outbound_ip outbound_input
+  local current_server="" current_port=1080 current_user=socks current_password="" current_name="" current_udp="" current_outbound=""
   if [[ "$action" == edit ]]; then
     load_socks || return 1
     current_server="$SOCKS_SERVER_IP"; current_port="$SOCKS_PORT"
     current_user="$SOCKS_USER"; current_password="$SOCKS_PASSWORD"
-    current_name="$SOCKS_NODE_NAME"; current_udp="$SOCKS_UDP_IP"
+    current_name="$SOCKS_NODE_NAME"; current_udp="$SOCKS_UDP_IP"; current_outbound="$SOCKS_OUTBOUND_IP"
   else
     current_server="$(public_ip)"
   fi
@@ -1199,6 +1228,20 @@ configure_socks() {
   fi
   udp_ip="$(prompt "UDP 转发公网 IPv4（客户端可达；NAT 填映射公网 IP）" "$udp_default")"
   validate_ipv4 "$udp_ip" || { yellow "UDP 转发地址必须是有效 IPv4。"; return 1; }
+  if [[ "$action" == edit && -n "$current_outbound" ]]; then
+    read -r -p "出站源 IP [${current_outbound}]（留空保持；输入 auto 恢复 VPS 默认）: " outbound_input
+    case "$outbound_input" in
+      '') outbound_ip="$current_outbound" ;;
+      auto) outbound_ip="" ;;
+      *) outbound_ip="$outbound_input" ;;
+    esac
+  else
+    read -r -p "出站源 IP（留空保持 VPS 默认；可填本机 IPv4/IPv6）: " outbound_ip
+  fi
+  if [[ -n "$outbound_ip" ]] && ! validate_local_outbound_ip "$outbound_ip"; then
+    yellow "出站源 IP 必须是本机已配置的 IPv4/IPv6；请用 ip addr show 查看并复制地址。"
+    return 1
+  fi
   username="$(prompt "用户名" "$current_user")"
   validate_socks_credential "$username" || { yellow "用户名必须为 1-255 字节，不能包含控制字符。"; return 1; }
   password="$(prompt "密码（安装时留空自动生成；修改时留空保持）" "$current_password")"
@@ -1212,7 +1255,7 @@ configure_socks() {
   if [[ -f "$SOCKS_CONFIG" ]] && ! install -m600 -o root -g root "$SOCKS_CONFIG" "$backup.json"; then
     rm -rf -- "$backup"; return 1
   fi
-  if ! write_socks_env "$server_ip" "$port" "$username" "$password" "$node_name" "$udp_ip" xray-fixed; then
+  if ! write_socks_env "$server_ip" "$port" "$username" "$password" "$node_name" "$udp_ip" xray-fixed "$outbound_ip"; then
     restore_state "$backup"
     rm -rf -- "$backup"; rm -f -- "$backup.json"; return 1
   fi
@@ -1234,6 +1277,7 @@ show_socks() {
   [[ "$host" == *:* && "$host" != \[*\] ]] && host="[$host]"
   printf '\nSOCKS5 节点信息\n名称：%s\n服务器：%s\n端口：%s\n用户名：%s\n密码：%s\nUDP 转发 IPv4：%s\n网络：TCP + UDP\n' \
     "$SOCKS_NODE_NAME" "$SOCKS_SERVER_IP" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASSWORD" "$SOCKS_UDP_IP"
+  printf '出站源 IP：%s\n' "${SOCKS_OUTBOUND_IP:-VPS 默认}"
   info "客户端需支持 SOCKS5 UDP ASSOCIATE；如不识别链接，请按上述字段手动添加。"
   if socks_is_independent; then
     info "独立 Xray ${SOCKS_VERSION}；固定 TCP/UDP ${SOCKS_PORT}，与 REALITY/SS 内核分开管理。"

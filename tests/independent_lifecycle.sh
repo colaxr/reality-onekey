@@ -42,6 +42,32 @@ rebuild_config
 cp "$CONFIG_FILE" "$TEST_ROOT/ss-original.json"
 mkdir "$TEST_ROOT/new-backup"
 backup_state "$TEST_ROOT/new-backup"
+ip() {
+  printf '    inet 192.0.2.10/24 scope global eth0\n    inet6 2001:db8::10/64 scope global eth0\n'
+}
+validate_local_outbound_ip 192.0.2.10
+validate_local_outbound_ip 2001:db8::10
+if validate_local_outbound_ip 2001:db8::11 || validate_local_outbound_ip '2001:db8::10/64'; then
+  echo 'FAIL: non-local or CIDR outbound source accepted'; exit 1
+fi
+unset -f ip
+write_socks_env 192.0.2.1 31080 test-user test-pass Test 192.0.2.1 xray-fixed
+render_socks_config >"$TEST_ROOT/socks-default.json"
+write_socks_env 192.0.2.1 31080 test-user test-pass Test 192.0.2.1 xray-fixed 2001:db8::10
+render_socks_config >"$TEST_ROOT/socks-ipv6.json"
+write_socks_env 192.0.2.1 31080 test-user test-pass Test 192.0.2.1 xray-fixed 192.0.2.10
+render_socks_config >"$TEST_ROOT/socks-ipv4.json"
+node -e '
+const fs = require("fs");
+const [original, ipv6, ipv4] = process.argv.slice(1).map(p => JSON.parse(fs.readFileSync(p)));
+const out = c => c.outbounds[0];
+if (JSON.stringify(out(original)) !== JSON.stringify({protocol:"freedom",tag:"direct"})) process.exit(1);
+for (const [config, ip, strategy] of [[ipv6,"2001:db8::10","ForceIPv6"],[ipv4,"192.0.2.10","ForceIPv4"]]) {
+  if (out(config).sendThrough !== ip || out(config).settings.domainStrategy !== strategy ||
+      out(config).streamSettings.sockopt.domainStrategy !== strategy ||
+      config.inbounds[0].settings.ip !== "192.0.2.1") process.exit(2);
+}
+' "$TEST_ROOT/socks-default.json" "$TEST_ROOT/socks-ipv6.json" "$TEST_ROOT/socks-ipv4.json"
 write_socks_env 192.0.2.1 31080 test-user test-pass Test 192.0.2.1 xray-fixed
 apply_socks_change "$TEST_ROOT/new-backup" >/dev/null
 [[ "$X_RESTARTS" == 0 ]]
@@ -114,14 +140,14 @@ install_common() {
 }
 select_ss_method() { printf 'aes-256-gcm'; }
 X_RESTARTS=0
-configure_socks install >/dev/null
+configure_socks install <<<'' >/dev/null
 [[ "$SOCKS_INSTALLS" == 1 && "$MAIN_INSTALLS" == 0 && "$X_RESTARTS" == 0 ]]
 [[ -f "$SOCKS_BIN" && ! -f "$XRAY_BIN" && ! -f "$CONFIG_FILE" ]]
 cp "$SOCKS_CONFIG" "$TEST_ROOT/fixed.saved"
 install_ss >/dev/null
 [[ "$MAIN_INSTALLS" == 1 && "$X_RESTARTS" == 1 ]]
 cmp "$SOCKS_CONFIG" "$TEST_ROOT/fixed.saved"
-configure_socks edit >/dev/null
+configure_socks edit <<<'' >/dev/null
 [[ "$MAIN_INSTALLS" == 1 && "$X_RESTARTS" == 1 ]]
 cmp "$SOCKS_CONFIG" "$TEST_ROOT/fixed.saved"
 
