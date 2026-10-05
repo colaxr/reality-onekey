@@ -23,6 +23,9 @@ source <(sed '$d' reality.sh)
 write_socks_env 127.0.0.1 "$1" test-user test-password Test "$2" xray-fixed
 mkdir -p "$SOCKS_DIR"
 render_socks_config > "$SOCKS_CONFIG"
+write_socks_env 127.0.0.1 "$1" test-user test-password Test "$2" xray-fixed '' ipv6
+render_socks_config > "$SOCKS_DIR/config.auto-ipv6.json"
+write_socks_env 127.0.0.1 "$1" test-user test-password Test "$2" xray-fixed
 ! has_xray_nodes
 ! managed_listeners | grep .
 if rebuild_config; then exit 1; fi
@@ -30,6 +33,8 @@ if rebuild_config; then exit 1; fi
         subprocess.run(["bash", "-c", script, "test", str(port), public_ip], env=env, check=True)
         config = str(Path(prefix) / "etc/reality-onekey-socks/config.json")
         subprocess.run([binary, "run", "-test", "-c", config], check=True)
+        auto_config = str(Path(prefix) / "etc/reality-onekey-socks/config.auto-ipv6.json")
+        subprocess.run([binary, "run", "-test", "-c", auto_config], check=True)
         main_process = None
         if main_binary:
             main_script = r'''

@@ -544,17 +544,34 @@ load_socks() {
   fi
   SOCKS_BACKEND=xray
   SOCKS_OUTBOUND_IP=""
+  SOCKS_OUTBOUND_MODE=""
   # shellcheck disable=SC1090
   . "$SOCKS_ENV_FILE"
+  if [[ -z "$SOCKS_OUTBOUND_MODE" ]]; then
+    if [[ -n "$SOCKS_OUTBOUND_IP" ]]; then
+      SOCKS_OUTBOUND_MODE=fixed
+    else
+      SOCKS_OUTBOUND_MODE=default
+    fi
+  fi
   [[ "$SOCKS_BACKEND" == xray || "$SOCKS_BACKEND" == xray-fixed ]] || return 1
   SOCKS_USER="$(base64_decode "$SOCKS_USER_B64" 2>/dev/null)" || return 1
   SOCKS_PASSWORD="$(base64_decode "$SOCKS_PASSWORD_B64" 2>/dev/null)" || return 1
   validate_socks_credential "$SOCKS_USER" && validate_socks_credential "$SOCKS_PASSWORD" &&
-    validate_ipv4 "$SOCKS_UDP_IP" && validate_port "$SOCKS_PORT" &&
-    { [[ -z "$SOCKS_OUTBOUND_IP" ]] || [[ "$SOCKS_OUTBOUND_IP" == *:* ]] || validate_ipv4 "$SOCKS_OUTBOUND_IP"; }
+    validate_ipv4 "$SOCKS_UDP_IP" && validate_port "$SOCKS_PORT" || return 1
+  case "$SOCKS_OUTBOUND_MODE" in
+    default|ipv6) [[ -z "$SOCKS_OUTBOUND_IP" ]] ;;
+    fixed) [[ -n "$SOCKS_OUTBOUND_IP" ]] &&
+      { [[ "$SOCKS_OUTBOUND_IP" == *:* ]] || validate_ipv4 "$SOCKS_OUTBOUND_IP"; } ;;
+    *) return 1 ;;
+  esac
 }
 
 write_socks_env() {
+  local outbound_ip="${8:-}" outbound_mode="${9:-}"
+  if [[ -z "$outbound_mode" ]]; then
+    if [[ -n "$outbound_ip" ]]; then outbound_mode=fixed; else outbound_mode=default; fi
+  fi
   [[ -d "$APP_DIR" ]] || install -d -m700 "$APP_DIR" || return 1
   cat >"$SOCKS_ENV_FILE" <<EOF
 SOCKS_SERVER_IP='$1'
@@ -564,7 +581,8 @@ SOCKS_PASSWORD_B64='$(base64_encode "$4")'
 SOCKS_NODE_NAME='$5'
 SOCKS_UDP_IP='$6'
 SOCKS_BACKEND='${7:-xray}'
-SOCKS_OUTBOUND_IP='${8:-}'
+SOCKS_OUTBOUND_IP='${outbound_ip}'
+SOCKS_OUTBOUND_MODE='${outbound_mode}'
 EOF
   chmod 600 "$SOCKS_ENV_FILE"
 }
@@ -1011,15 +1029,19 @@ download_socks() {
 render_socks_config() {
   load_socks quiet || return 1
   local outbound='{ "protocol": "freedom", "tag": "direct" }' strategy
-  if [[ -n "$SOCKS_OUTBOUND_IP" ]]; then
-    if [[ "$SOCKS_OUTBOUND_IP" == *:* ]]; then
+  if [[ "$SOCKS_OUTBOUND_MODE" != default ]]; then
+    if [[ "$SOCKS_OUTBOUND_MODE" == ipv6 || "$SOCKS_OUTBOUND_IP" == *:* ]]; then
       strategy=ForceIPv6
     else
       strategy=ForceIPv4
     fi
     # v26.3.27 Freedom uses settings.domainStrategy for UDP packets;
     # sockopt covers dialing and TCP destination resolution.
-    outbound="{ \"protocol\": \"freedom\", \"tag\": \"direct\", \"sendThrough\": \"$(json_escape "$SOCKS_OUTBOUND_IP")\", \"settings\": { \"domainStrategy\": \"${strategy}\" }, \"streamSettings\": { \"sockopt\": { \"domainStrategy\": \"${strategy}\" } } }"
+    outbound="{ \"protocol\": \"freedom\", \"tag\": \"direct\", \"settings\": { \"domainStrategy\": \"${strategy}\" }, \"streamSettings\": { \"sockopt\": { \"domainStrategy\": \"${strategy}\" } }"
+    if [[ "$SOCKS_OUTBOUND_MODE" == fixed ]]; then
+      outbound+=", \"sendThrough\": \"$(json_escape "$SOCKS_OUTBOUND_IP")\""
+    fi
+    outbound+=' }'
   fi
   cat <<EOF
 {
@@ -1202,13 +1224,14 @@ apply_socks_change() {
 }
 
 configure_socks() {
-  local action="${1:-install}" server_ip port username password node_name udp_ip udp_default backup outbound_ip outbound_input
-  local current_server="" current_port=1080 current_user=socks current_password="" current_name="" current_udp="" current_outbound=""
+  local action="${1:-install}" server_ip port username password node_name udp_ip udp_default backup outbound_ip outbound_mode outbound_input
+  local current_server="" current_port=1080 current_user=socks current_password="" current_name="" current_udp="" current_outbound="" current_mode=default
   if [[ "$action" == edit ]]; then
     load_socks || return 1
     current_server="$SOCKS_SERVER_IP"; current_port="$SOCKS_PORT"
     current_user="$SOCKS_USER"; current_password="$SOCKS_PASSWORD"
-    current_name="$SOCKS_NODE_NAME"; current_udp="$SOCKS_UDP_IP"; current_outbound="$SOCKS_OUTBOUND_IP"
+    current_name="$SOCKS_NODE_NAME"; current_udp="$SOCKS_UDP_IP"
+    current_outbound="$SOCKS_OUTBOUND_IP"; current_mode="$SOCKS_OUTBOUND_MODE"
   else
     current_server="$(public_ip)"
   fi
@@ -1228,17 +1251,23 @@ configure_socks() {
   fi
   udp_ip="$(prompt "UDP 转发公网 IPv4（客户端可达；NAT 填映射公网 IP）" "$udp_default")"
   validate_ipv4 "$udp_ip" || { yellow "UDP 转发地址必须是有效 IPv4。"; return 1; }
-  if [[ "$action" == edit && -n "$current_outbound" ]]; then
-    read -r -p "出站源 IP [${current_outbound}]（留空保持；输入 auto 恢复 VPS 默认）: " outbound_input
+  if [[ "$action" == edit && "$current_mode" != default ]]; then
+    read -r -p "出站方式 [${current_outbound:-自动 IPv6}]（留空保持；auto 恢复 VPS 默认；ipv6 自动 IPv6；或填本机 IP）: " outbound_input
     case "$outbound_input" in
-      '') outbound_ip="$current_outbound" ;;
-      auto) outbound_ip="" ;;
-      *) outbound_ip="$outbound_input" ;;
+      '') outbound_mode="$current_mode"; outbound_ip="$current_outbound" ;;
+      auto) outbound_mode=default; outbound_ip="" ;;
+      ipv6) outbound_mode=ipv6; outbound_ip="" ;;
+      *) outbound_mode=fixed; outbound_ip="$outbound_input" ;;
     esac
   else
-    read -r -p "出站源 IP（留空保持 VPS 默认；可填本机 IPv4/IPv6）: " outbound_ip
+    read -r -p "出站方式（留空 VPS 默认；输入 ipv6 自动走 IPv6；或填本机 IPv4/IPv6）: " outbound_input
+    case "$outbound_input" in
+      ''|auto) outbound_mode=default; outbound_ip="" ;;
+      ipv6) outbound_mode=ipv6; outbound_ip="" ;;
+      *) outbound_mode=fixed; outbound_ip="$outbound_input" ;;
+    esac
   fi
-  if [[ -n "$outbound_ip" ]] && ! validate_local_outbound_ip "$outbound_ip"; then
+  if [[ "$outbound_mode" == fixed ]] && ! validate_local_outbound_ip "$outbound_ip"; then
     yellow "出站源 IP 必须是本机已配置的 IPv4/IPv6；请用 ip addr show 查看并复制地址。"
     return 1
   fi
@@ -1255,7 +1284,7 @@ configure_socks() {
   if [[ -f "$SOCKS_CONFIG" ]] && ! install -m600 -o root -g root "$SOCKS_CONFIG" "$backup.json"; then
     rm -rf -- "$backup"; return 1
   fi
-  if ! write_socks_env "$server_ip" "$port" "$username" "$password" "$node_name" "$udp_ip" xray-fixed "$outbound_ip"; then
+  if ! write_socks_env "$server_ip" "$port" "$username" "$password" "$node_name" "$udp_ip" xray-fixed "$outbound_ip" "$outbound_mode"; then
     restore_state "$backup"
     rm -rf -- "$backup"; rm -f -- "$backup.json"; return 1
   fi
@@ -1277,7 +1306,11 @@ show_socks() {
   [[ "$host" == *:* && "$host" != \[*\] ]] && host="[$host]"
   printf '\nSOCKS5 节点信息\n名称：%s\n服务器：%s\n端口：%s\n用户名：%s\n密码：%s\nUDP 转发 IPv4：%s\n网络：TCP + UDP\n' \
     "$SOCKS_NODE_NAME" "$SOCKS_SERVER_IP" "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASSWORD" "$SOCKS_UDP_IP"
-  printf '出站源 IP：%s\n' "${SOCKS_OUTBOUND_IP:-VPS 默认}"
+  case "$SOCKS_OUTBOUND_MODE" in
+    ipv6) printf '出站方式：自动 IPv6（公网出口由 VPS/宿主机决定）\n' ;;
+    fixed) printf '出站源 IP：%s\n' "$SOCKS_OUTBOUND_IP" ;;
+    *) printf '出站方式：VPS 默认\n' ;;
+  esac
   info "客户端需支持 SOCKS5 UDP ASSOCIATE；如不识别链接，请按上述字段手动添加。"
   if socks_is_independent; then
     info "独立 Xray ${SOCKS_VERSION}；固定 TCP/UDP ${SOCKS_PORT}，与 REALITY/SS 内核分开管理。"
