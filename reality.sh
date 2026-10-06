@@ -487,6 +487,7 @@ load_reality() {
     [[ "${1:-}" == quiet ]] || yellow "尚未安装 REALITY 节点。"
     return 1
   fi
+  REALITY_OUTBOUND_IP=""
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   : "${NODE_NAME:=REALITY-${SERVER_IP}}"
@@ -498,6 +499,7 @@ load_ss() {
     [[ "${1:-}" == quiet ]] || yellow "尚未安装 Shadowsocks 节点。"
     return 1
   fi
+  SS_OUTBOUND_IP=""
   # shellcheck disable=SC1090
   . "$SS_ENV_FILE"
   SS_PASSWORD="$(base64_decode "$SS_PASSWORD_B64" 2>/dev/null)" || {
@@ -535,6 +537,45 @@ validate_local_outbound_ip() {
     }
     END { exit !found }
   '
+}
+
+validate_outbound_choice() {
+  case "$1" in
+    ""|ipv4|ipv6) return 0 ;;
+    *) validate_local_outbound_ip "$1" ;;
+  esac
+}
+
+prompt_outbound_choice() {
+  local current="${1:-}" value
+  if [[ -n "$current" ]]; then
+    read -r -p "出站源 IP/地址族 [${current}]（回车保持；auto 恢复 VPS 默认；ipv4/ipv6 或本机 IP）: " value
+    [[ -n "$value" ]] || value="$current"
+  else
+    read -r -p "出站源 IP/地址族（回车保持 VPS 默认；ipv4/ipv6 或本机 IP）: " value
+  fi
+  [[ "$value" != auto ]] || value=""
+  if ! validate_outbound_choice "$value"; then
+    yellow "出站源 IP 必须是本机已配置的 IPv4/IPv6；可输入 ipv4、ipv6，或用 ip addr show 核对本机地址。" >&2
+    return 1
+  fi
+  printf '%s' "$value"
+}
+
+render_direct_outbound() {
+  local tag="$1" choice="$2" strategy="" source=""
+  case "$choice" in
+    ipv4) strategy=ForceIPv4 ;;
+    ipv6) strategy=ForceIPv6 ;;
+    *:*) strategy=ForceIPv6; source="$choice" ;;
+    ?*) strategy=ForceIPv4; source="$choice" ;;
+  esac
+  printf '{ "protocol": "freedom", "tag": "%s"' "$tag"
+  if [[ -n "$strategy" ]]; then
+    [[ -z "$source" ]] || printf ', "sendThrough": "%s"' "$(json_escape "$source")"
+    printf ', "settings": { "domainStrategy": "%s" }, "streamSettings": { "sockopt": { "domainStrategy": "%s" } }' "$strategy" "$strategy"
+  fi
+  printf ' }'
 }
 
 load_socks() {
@@ -589,7 +630,7 @@ EOF
 
 write_reality_env() {
   local port="$1" uuid="$2" domain="$3" dest="$4" public_key="$6"
-  local short_id="$7" server_ip="$8" fingerprint="$9" node_name="${10}" xudp_enabled="${11}"
+  local short_id="$7" server_ip="$8" fingerprint="$9" node_name="${10}" xudp_enabled="${11}" outbound_ip="${12:-}"
   install -d -m700 "$APP_DIR"
   cat >"$ENV_FILE" <<EOF
 SERVER_IP='${server_ip}'
@@ -603,12 +644,13 @@ FLOW='xtls-rprx-vision'
 FINGERPRINT='${fingerprint}'
 NODE_NAME='${node_name}'
 XUDP_ENABLED='${xudp_enabled}'
+REALITY_OUTBOUND_IP='${outbound_ip}'
 EOF
   chmod 600 "$ENV_FILE"
 }
 
 write_ss_env() {
-  local server_ip="$1" port="$2" method="$3" password="$4" node_name="$5"
+  local server_ip="$1" port="$2" method="$3" password="$4" node_name="$5" outbound_ip="${6:-}"
   install -d -m700 "$APP_DIR"
   cat >"$SS_ENV_FILE" <<EOF
 SS_SERVER_IP='${server_ip}'
@@ -617,6 +659,7 @@ SS_METHOD='${method}'
 SS_PASSWORD_B64='$(base64_encode "$password")'
 SS_NODE_NAME='${node_name}'
 SS_NETWORK='tcp,udp'
+SS_OUTBOUND_IP='${outbound_ip}'
 EOF
   chmod 600 "$SS_ENV_FILE"
 }
@@ -624,13 +667,15 @@ EOF
 # Uppercase fields are loaded dynamically from the root-owned node env files.
 # shellcheck disable=SC2153
 rebuild_config() {
-  local output="${1:-$CONFIG_FILE}" comma="" private_key ss_password
+  local output="${1:-$CONFIG_FILE}" comma="" private_key ss_password reality_outbound="" ss_outbound=""
   has_xray_nodes || return 1
   # Rendering a candidate must not change permissions of the live directory.
   [[ -d "$APP_DIR" ]] || install -d -m700 "$APP_DIR" || return 1
   {
     printf '{\n  "log": { "loglevel": "warning" },\n  "inbounds": ['
     if load_reality quiet; then
+      reality_outbound="$REALITY_OUTBOUND_IP"
+      validate_outbound_choice "$reality_outbound" || return 1
       if [[ -n "${PRIVATE_KEY:-}" ]]; then
         private_key="$PRIVATE_KEY"
       else
@@ -670,6 +715,8 @@ EOF
       comma=,
     fi
     if load_ss quiet; then
+      ss_outbound="$SS_OUTBOUND_IP"
+      validate_outbound_choice "$ss_outbound" || return 1
       ss_password="$SS_PASSWORD"
       printf '%s\n' "$comma"
       cat <<EOF
@@ -709,11 +756,30 @@ EOF
     cat <<'EOF'
   ],
   "outbounds": [
-    { "protocol": "freedom", "tag": "direct" },
-    { "protocol": "blackhole", "tag": "block" }
-  ]
-}
+    { "protocol": "freedom", "tag": "direct" }
 EOF
+    if [[ -n "$reality_outbound" ]]; then
+      printf ',\n    '
+      render_direct_outbound reality-direct "$reality_outbound"
+    fi
+    if [[ -n "$ss_outbound" ]]; then
+      printf ',\n    '
+      render_direct_outbound ss-direct "$ss_outbound"
+    fi
+    printf ',\n    { "protocol": "blackhole", "tag": "block" }\n  ]'
+    if [[ -n "$reality_outbound" || -n "$ss_outbound" ]]; then
+      printf ',\n  "routing": { "rules": ['
+      comma=""
+      if [[ -n "$reality_outbound" ]]; then
+        printf '\n    { "type": "field", "inboundTag": ["reality-in"], "outboundTag": "reality-direct" }'
+        comma=,
+      fi
+      if [[ -n "$ss_outbound" ]]; then
+        printf '%s\n    { "type": "field", "inboundTag": ["ss-in"], "outboundTag": "ss-direct" }' "$comma"
+      fi
+      printf '\n  ] }'
+    fi
+    printf '\n}\n'
   } >"$output"
   chmod 600 "$output"
 }
@@ -798,7 +864,7 @@ apply_node_change() {
 }
 
 install_reality() {
-  local port domain dest uuid keys private_key public_key short_id server_ip fingerprint node_name xudp_enabled backup
+  local port domain dest uuid keys private_key public_key short_id server_ip fingerprint node_name xudp_enabled outbound_ip backup
   install_common
 
   port="$(prompt "监听端口" "443")"
@@ -815,6 +881,7 @@ install_reality() {
   node_name="$(prompt "节点名称" "REALITY-${server_ip}")"
   validate_node_name "$node_name" || die "节点名称不能为空、不能包含单引号/换行，且最长 64 个字符。"
   xudp_enabled="$(prompt_yes_no "启用 XUDP/UDP 支持" "true")"
+  outbound_ip="$(prompt_outbound_choice)" || return 1
 
   uuid="$("$XRAY_BIN" uuid)"
   keys="$("$XRAY_BIN" x25519)"
@@ -825,7 +892,7 @@ install_reality() {
   backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
   backup_state "$backup"
   PRIVATE_KEY="$private_key"
-  write_reality_env "$port" "$uuid" "$domain" "$dest" "$private_key" "$public_key" "$short_id" "$server_ip" "$fingerprint" "$node_name" "$xudp_enabled"
+  write_reality_env "$port" "$uuid" "$domain" "$dest" "$private_key" "$public_key" "$short_id" "$server_ip" "$fingerprint" "$node_name" "$xudp_enabled" "$outbound_ip"
   if apply_node_change "$backup" "REALITY 安装完成。请确认已放行 TCP ${port}。"; then
     rm -rf -- "$backup"
     show_reality
@@ -848,8 +915,8 @@ show_reality() {
   fi
   link="vless://${UUID}@${host}:${PORT}?encryption=none&flow=${FLOW}&security=reality&sni=${SNI}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp${xudp_param}#$(urlencode "$NODE_NAME")"
   printf '\n节点信息\n'
-  printf '名称：%s\n服务器：%s\n端口：%s\nUUID：%s\nSNI：%s\nPublic Key：%s\nShort ID：%s\nXUDP/UDP：%s\n\n' \
-    "$NODE_NAME" "$SERVER_IP" "$PORT" "$UUID" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$xudp_status"
+  printf '名称：%s\n服务器：%s\n端口：%s\nUUID：%s\nSNI：%s\nPublic Key：%s\nShort ID：%s\nXUDP/UDP：%s\n出站：%s\n\n' \
+    "$NODE_NAME" "$SERVER_IP" "$PORT" "$UUID" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$xudp_status" "${REALITY_OUTBOUND_IP:-VPS 默认}"
   green "$link"
 }
 
@@ -869,7 +936,7 @@ select_ss_method() {
 }
 
 install_ss() {
-  local server_ip port method password node_name backup
+  local server_ip port method password node_name outbound_ip backup
   install_common
   server_ip="$(prompt "服务器公网 IP/域名" "$(public_ip)")"
   validate_server_address "$server_ip" || { yellow "服务器地址格式不正确。"; return 1; }
@@ -882,9 +949,10 @@ install_ss() {
   validate_password "$password" || { yellow "密码不能为空、不能包含换行，且最长 256 个字符。"; return 1; }
   node_name="$(prompt "节点名称" "SS-${server_ip}")"
   validate_node_name "$node_name" || { yellow "节点名称不能为空、不能包含单引号/换行，且最长 64 个字符。"; return 1; }
+  outbound_ip="$(prompt_outbound_choice)" || return 1
   backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
   backup_state "$backup"
-  write_ss_env "$server_ip" "$port" "$method" "$password" "$node_name"
+  write_ss_env "$server_ip" "$port" "$method" "$password" "$node_name" "$outbound_ip"
   if apply_node_change "$backup" "Shadowsocks 安装完成，TCP 和 UDP 均已启用。请在安全组/防火墙放行 TCP/UDP ${port}。"; then
     rm -rf -- "$backup"
     show_ss
@@ -902,15 +970,15 @@ show_ss() {
   userinfo="$(base64url_encode "${SS_METHOD}:${SS_PASSWORD}")"
   link="ss://${userinfo}@${host}:${SS_PORT}#$(urlencode "$SS_NODE_NAME")"
   printf '\nShadowsocks 节点信息\n'
-  printf '名称：%s\n服务器：%s\n端口：%s\n加密：%s\n网络：TCP + UDP\n密码：%s\n\n' \
-    "$SS_NODE_NAME" "$SS_SERVER_IP" "$SS_PORT" "$SS_METHOD" "$SS_PASSWORD"
+  printf '名称：%s\n服务器：%s\n端口：%s\n加密：%s\n网络：TCP + UDP\n密码：%s\n出站：%s\n\n' \
+    "$SS_NODE_NAME" "$SS_SERVER_IP" "$SS_PORT" "$SS_METHOD" "$SS_PASSWORD" "${SS_OUTBOUND_IP:-VPS 默认}"
   green "$link"
 }
 
 # shellcheck disable=SC2153
 edit_node() {
   load_reality || return 1
-  local server_ip port uuid domain dest short_id fingerprint node_name xudp_enabled private_key
+  local server_ip port uuid domain dest short_id fingerprint node_name xudp_enabled private_key outbound_ip
   local backup
   private_key="$(sed -n 's/.*"privateKey":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_FILE" | sed -n '1p')"
   if [[ -z "$private_key" ]]; then
@@ -940,11 +1008,12 @@ edit_node() {
   validate_node_name "$node_name" ||
     { yellow "节点名称不能为空、不能包含单引号/换行，且最长 64 个字符。"; return 1; }
   xudp_enabled="$(prompt_yes_no "启用 XUDP/UDP 支持" "$XUDP_ENABLED")"
+  outbound_ip="$(prompt_outbound_choice "$REALITY_OUTBOUND_IP")" || return 1
 
   backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
   backup_state "$backup"
   PRIVATE_KEY="$private_key"
-  write_reality_env "$port" "$uuid" "$domain" "$dest" "$private_key" "$PUBLIC_KEY" "$short_id" "$server_ip" "$fingerprint" "$node_name" "$xudp_enabled"
+  write_reality_env "$port" "$uuid" "$domain" "$dest" "$private_key" "$PUBLIC_KEY" "$short_id" "$server_ip" "$fingerprint" "$node_name" "$xudp_enabled" "$outbound_ip"
   if apply_node_change "$backup" "REALITY 节点已修改并重启。请确认已放行 TCP ${port}。"; then
     rm -rf -- "$backup"
     show_reality
@@ -956,7 +1025,7 @@ edit_node() {
 
 edit_ss() {
   load_ss || return 1
-  local server_ip port method password node_name backup
+  local server_ip port method password node_name outbound_ip backup
   server_ip="$(prompt "服务器公网 IP/域名" "$SS_SERVER_IP")"
   validate_server_address "$server_ip" || { yellow "服务器地址格式不正确。"; return 1; }
   port="$(prompt "监听端口" "$SS_PORT")"
@@ -967,9 +1036,10 @@ edit_ss() {
   validate_password "$password" || { yellow "密码不能为空、不能包含换行，且最长 256 个字符。"; return 1; }
   node_name="$(prompt "节点名称" "$SS_NODE_NAME")"
   validate_node_name "$node_name" || { yellow "节点名称格式不正确。"; return 1; }
+  outbound_ip="$(prompt_outbound_choice "$SS_OUTBOUND_IP")" || return 1
   backup="$(mktemp -d /var/tmp/reality-state.XXXXXX)" || return 1
   backup_state "$backup"
-  write_ss_env "$server_ip" "$port" "$method" "$password" "$node_name"
+  write_ss_env "$server_ip" "$port" "$method" "$password" "$node_name" "$outbound_ip"
   if apply_node_change "$backup" "Shadowsocks 节点已修改，TCP 和 UDP 均已启用。"; then
     rm -rf -- "$backup"
     show_ss

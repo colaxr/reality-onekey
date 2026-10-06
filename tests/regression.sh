@@ -162,7 +162,51 @@ const s = c.inbounds.find(x => x.tag === "ss-in");
 if (!r || r.streamSettings.realitySettings.privateKey !== "CNbUQuA6-wuMRF2DIaS6R3CUJBa7CGO0wLE8Aj0HoH0") process.exit(2);
 if (!s || s.settings.network !== "tcp,udp") process.exit(3);
 if (s.settings.password !== "p@ss\"word\\\\test") process.exit(4);
+if (c.routing || c.outbounds.length !== 2) process.exit(5);
 ' "$CONFIG_FILE.new"
+
+# Dedicated REALITY/SS exits must not change the other protocol or legacy defaults.
+ip() { printf '2: eth0: <UP>\n    inet 192.0.2.20/24 scope global eth0\n    inet6 2001:db8::20/64 scope global\n'; }
+[[ "$(printf 'ipv4\n' | prompt_outbound_choice)" == ipv4 ]]
+[[ "$(printf 'ipv6\n' | prompt_outbound_choice)" == ipv6 ]]
+[[ "$(printf '2001:db8::20\n' | prompt_outbound_choice)" == 2001:db8::20 ]]
+[[ -z "$(printf 'auto\n' | prompt_outbound_choice ipv4)" ]]
+if printf '2001:db8::99\n' | prompt_outbound_choice >/dev/null 2>&1; then
+  echo 'FAIL: nonlocal outbound IP accepted'; exit 1
+fi
+write_reality_env 24443 11111111-1111-4111-8111-111111111111 example.com example.com:443 \
+  CNbUQuA6-wuMRF2DIaS6R3CUJBa7CGO0wLE8Aj0HoH0 public-test aabbccdd 192.0.2.1 chrome 'REALITY Test' true ipv6
+write_ss_env 192.0.2.1 28388 aes-256-gcm 'p@ss"word\\test' 'SS Test' 192.0.2.20
+rebuild_config "$CONFIG_FILE.outbound"
+node -e '
+const c=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));
+const r=c.outbounds.find(x=>x.tag==="reality-direct");
+const s=c.outbounds.find(x=>x.tag==="ss-direct");
+if(r.sendThrough || r.settings.domainStrategy!=="ForceIPv6" || r.streamSettings.sockopt.domainStrategy!=="ForceIPv6") process.exit(1);
+if(s.sendThrough!=="192.0.2.20" || s.settings.domainStrategy!=="ForceIPv4" || s.streamSettings.sockopt.domainStrategy!=="ForceIPv4") process.exit(2);
+if(c.routing.rules.length!==2 || c.routing.rules[0].inboundTag[0]!=="reality-in" || c.routing.rules[0].outboundTag!=="reality-direct" || c.routing.rules[1].inboundTag[0]!=="ss-in" || c.routing.rules[1].outboundTag!=="ss-direct") process.exit(3);
+' "$CONFIG_FILE.outbound"
+cp "$ENV_FILE" "$TEST_ROOT/outbound-reality.env"
+rm -f -- "$ENV_FILE"
+rebuild_config "$CONFIG_FILE.outbound-ss-only"
+node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1])); if(c.inbounds.length!==1 || c.routing.rules.length!==1 || c.routing.rules[0].outboundTag!=="ss-direct" || c.outbounds.some(x=>x.tag==="reality-direct")) process.exit(1)' "$CONFIG_FILE.outbound-ss-only"
+mv "$TEST_ROOT/outbound-reality.env" "$ENV_FILE"
+cp "$SS_ENV_FILE" "$TEST_ROOT/outbound-ss.env"
+rm -f -- "$SS_ENV_FILE"
+rebuild_config "$CONFIG_FILE.outbound-reality-only"
+node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1])); if(c.inbounds.length!==1 || c.routing.rules.length!==1 || c.routing.rules[0].outboundTag!=="reality-direct" || c.outbounds.some(x=>x.tag==="ss-direct")) process.exit(1)' "$CONFIG_FILE.outbound-reality-only"
+mv "$TEST_ROOT/outbound-ss.env" "$SS_ENV_FILE"
+write_reality_env 24443 11111111-1111-4111-8111-111111111111 example.com example.com:443 \
+  CNbUQuA6-wuMRF2DIaS6R3CUJBa7CGO0wLE8Aj0HoH0 public-test aabbccdd 192.0.2.1 chrome 'REALITY Test' true ipv4
+write_ss_env 192.0.2.1 28388 aes-256-gcm 'p@ss"word\\test' 'SS Test' 2001:db8::20
+rebuild_config "$CONFIG_FILE.outbound-other-family"
+node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1])); const r=c.outbounds.find(x=>x.tag==="reality-direct"); const s=c.outbounds.find(x=>x.tag==="ss-direct"); if(r.sendThrough || r.settings.domainStrategy!=="ForceIPv4" || s.sendThrough!=="2001:db8::20" || s.settings.domainStrategy!=="ForceIPv6") process.exit(1)' "$CONFIG_FILE.outbound-other-family"
+write_ss_env 192.0.2.1 28388 aes-256-gcm 'p@ss"word\\test' 'SS Test'
+rebuild_config "$CONFIG_FILE.outbound-one"
+node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1])); if(c.routing.rules.length!==1 || c.outbounds.some(x=>x.tag==="ss-direct")) process.exit(1)' "$CONFIG_FILE.outbound-one"
+write_reality_env 24443 11111111-1111-4111-8111-111111111111 example.com example.com:443 \
+  CNbUQuA6-wuMRF2DIaS6R3CUJBa7CGO0wLE8Aj0HoH0 public-test aabbccdd 192.0.2.1 chrome 'REALITY Test' true
+unset -f ip
 load_ss quiet
 [[ "$SS_PASSWORD" == 'p@ss"word\\test' ]] || { echo 'FAIL: SS password round trip'; exit 1; }
 uri="$(base64url_encode "${SS_METHOD}:${SS_PASSWORD}")"
